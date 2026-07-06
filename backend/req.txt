@@ -1,0 +1,11 @@
+langchain
+langgraph
+python-dotenv
+langchain_ollama
+langchain-community
+langchain-core
+pydantic
+markdown
+faiss-cpu
+fastapi
+uvicorn
