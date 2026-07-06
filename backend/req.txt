@@ -9,3 +9,4 @@ markdown
 faiss-cpu
 fastapi
 uvicorn
+langgraph-checkpoint-sqlite

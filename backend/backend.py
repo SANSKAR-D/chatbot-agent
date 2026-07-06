@@ -2,7 +2,8 @@ from langgraph.graph import StateGraph, START, END
 from typing import TypedDict, Annotated
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, AIMessageChunk, SystemMessage
 from langchain_ollama import ChatOllama
-from langgraph.checkpoint.memory import MemorySaver
+from langgraph.checkpoint.sqlite import SqliteSaver
+import sqlite3
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode, tools_condition
 from langchain_core.tools import tool
@@ -15,7 +16,7 @@ load_dotenv()
 # -------------------
 # 1. LLM
 # -------------------
-llm = ChatOllama(model = "qwen2.5:3b")
+llm = ChatOllama(model = "qwen2.5:3b", temperature = 0)
 
 # -------------------
 # 2. Tools
@@ -59,15 +60,14 @@ def purchase_stock(symbol: str, quantity: int) -> dict:
     }
 
 @tool
-def search(search : str) -> dict:
+def search(query: str) -> dict:
     """
-    Search the web for anything you don't know real time,data,shops,places,etc.
-    Search the web for a given query if you don't know the answer of it.
+    Search the web for real-time information, news, current events, dates, historical facts, places, or any question you do not have the answer to.
+    Use this tool whenever the user asks about something that requires searching the internet or fetching current details.
     """
     tavily = TavilyClient(api_key=os.getenv("TAVILY_API_KEY"))
 
-    response = tavily.search(query=search, max_results=5)
-
+    response = tavily.search(query=query, max_results=5, search_depth="advanced")
     return response
 
 tools = [get_stock_price, purchase_stock,get_weather,search]
@@ -86,7 +86,15 @@ def chat_node(state: ChatState):
     """LLM node that may answer or request a tool call."""
     messages = state["messages"]
     system_message = SystemMessage(
-        content="You are a helpfull Ai agent you have access to various tools to fetch real time data. Use them when req"
+        content=(
+            "You are a helpful AI agent with access to real-time tools.\n"
+            "CRITICAL RULES:\n"
+            "1. ALWAYS use the appropriate tool (get_weather, get_stock_price, search) if the user asks about real-time, "
+            "current, historical, factual, or search-based topics (e.g. weather, stocks, places, events, facts, queries).\n"
+            "2. Do NOT attempt to answer questions about external facts, current events, or real-time data from your own memory. You MUST call a tool.\n"
+            "3. If you do not know the answer to a question or are unsure, ALWAYS use the 'search' tool.\n"
+            "4. Never say you don't have access to tools or real-time data."
+        )
     )
     response = llm_with_tools.invoke([system_message] + messages)
     return {"messages": [response]}
@@ -94,9 +102,10 @@ def chat_node(state: ChatState):
 tool_node = ToolNode(tools)
 
 # -------------------
-# 5. Checkpointer (in-memory)
+# 5. Checkpointer (persistent SQLite)
 # -------------------
-memory = MemorySaver()
+conn = sqlite3.connect("chatbot.db", check_same_thread=False)
+memory = SqliteSaver(conn)
 
 # -------------------
 # 6. Graph
