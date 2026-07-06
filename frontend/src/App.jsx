@@ -62,6 +62,14 @@ function App() {
         if (response.ok) {
           const data = await response.json();
           if (data && data.threads && data.threads.length > 0) {
+            // Update activeChatId to the first restored thread if currently selecting the temporary "New Chat"
+            setActiveChatId((currentId) => {
+              if (currentId && currentId.startsWith('chat_') && !data.threads.some(t => t.id === currentId)) {
+                return data.threads[0].id;
+              }
+              return currentId;
+            });
+
             setChats((prevChats) => {
               const mergedChats = [...prevChats];
               data.threads.forEach((backendThread) => {
