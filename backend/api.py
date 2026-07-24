@@ -1,4 +1,3 @@
-from asyncio import coroutines
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
@@ -6,12 +5,26 @@ from pydantic import BaseModel
 import json
 import asyncio
 import os
-import sqlite3
+import aiosqlite
+from contextlib import asynccontextmanager
+from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
-from backend import chatbot
+from backend import graph_builder
 from langchain_core.messages import HumanMessage, AIMessage, AIMessageChunk
 
-app = FastAPI()
+chatbot = None
+memory = None
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global chatbot, memory
+    db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "chatbot.db")
+    async with AsyncSqliteSaver.from_conn_string(db_path) as saver:
+        memory = saver
+        chatbot = graph_builder.compile(checkpointer=memory)
+        yield
+
+app = FastAPI(lifespan=lifespan)
 
 # Allow CORS for the React frontend
 app.add_middleware(
@@ -35,7 +48,7 @@ async def chat_endpoint(request: ChatRequest):
     config = {"configurable": {"thread_id": request.thread_id}}
     
     final_response = ""
-    for message_chunk, meta_data in chatbot.stream(state, config=config, stream_mode='messages'):
+    async for message_chunk, meta_data in chatbot.astream(state, config=config, stream_mode='messages'):
         if isinstance(message_chunk, (AIMessage, AIMessageChunk)) and message_chunk.content:
             final_response += message_chunk.content
             
@@ -46,12 +59,12 @@ async def chat_stream_endpoint(request: ChatRequest):
     """
     Server-Sent Events endpoint for streaming
     """
-    def event_generator():
+    async def event_generator():
         state = {"messages": [HumanMessage(content=request.message)]}
         config = {"configurable": {"thread_id": request.thread_id}}
         
         try:
-            for message_chunk, meta_data in chatbot.stream(state, config=config, stream_mode='messages'):
+            async for message_chunk, meta_data in chatbot.astream(state, config=config, stream_mode='messages'):
                 if isinstance(message_chunk, (AIMessage, AIMessageChunk)) and message_chunk.content:
                     data = json.dumps({"chunk": message_chunk.content})
                     yield f"data: {data}\n\n"
@@ -71,7 +84,7 @@ async def get_chat_history(thread_id: str):
     config = {"configurable": {"thread_id": thread_id}}
     try:
         # Get the compiled graph state
-        state = chatbot.get_state(config)
+        state = await chatbot.aget_state(config)
         
         # Extract messages list from state values
         messages = state.values.get("messages", []) if state.values else []
@@ -106,17 +119,16 @@ async def get_threads():
         db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "chatbot.db")
         
         # Connect and query unique thread IDs
-        conn = sqlite3.connect(db_path)
-        cursor = conn.cursor()
-        cursor.execute("SELECT DISTINCT thread_id FROM checkpoints")
-        thread_ids = [row[0] for row in cursor.fetchall()]
-        conn.close()
+        async with aiosqlite.connect(db_path) as conn:
+            async with conn.execute("SELECT DISTINCT thread_id FROM checkpoints") as cursor:
+                rows = await cursor.fetchall()
+                thread_ids = [row[0] for row in rows]
         
         # Build threads with titles from the first HumanMessage
         threads_list = []
         for t_id in thread_ids:
             config = {"configurable": {"thread_id": t_id}}
-            state = chatbot.get_state(config)
+            state = await chatbot.aget_state(config)
             messages = state.values.get("messages", []) if state.values else []
             
             # Find the first user message to use as title
