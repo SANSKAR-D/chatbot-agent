@@ -2,7 +2,7 @@ from langchain_ollama import OllamaEmbeddings
 from langgraph.graph import StateGraph, START, END
 from typing import TypedDict, Annotated
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, AIMessageChunk, SystemMessage
-from langchain_ollama import ChatOllama
+
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 import aiosqlite
 from langgraph.graph.message import add_messages
@@ -22,7 +22,8 @@ load_dotenv()
 # -------------------
 # 1. LLM
 # -------------------
-llm = ChatOllama(model = "qwen2.5:3b", temperature = 0)
+from langchain_google_genai import ChatGoogleGenerativeAI
+llm = ChatGoogleGenerativeAI(model="gemini-3.5-flash-lite", temperature=0)
 
 # -------------------
 # 2. Tools
@@ -99,7 +100,8 @@ async def search_pdf(query: str, config: RunnableConfig) -> str:
         return "No PDF documents have been uploaded for this chat yet."
     
     try:
-        embeddings = OllamaEmbeddings(model="nomic-embed-text")
+        from langchain_google_genai import GoogleGenerativeAIEmbeddings
+        embeddings = GoogleGenerativeAIEmbeddings(model="models/gemini-embedding-2")
         vectorstore = FAISS.load_local(vectorstore_path, embeddings, allow_dangerous_deserialization=True)
         retriever = vectorstore.as_retriever(search_kwargs={"k": 5})
         docs = await retriever.ainvoke(query)

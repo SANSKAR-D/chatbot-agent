@@ -75,8 +75,16 @@ async def chat_stream_endpoint(request: ChatRequest):
             while True:
                 async for message_chunk, meta_data in chatbot.astream(state, config=config, stream_mode='messages'):
                     if isinstance(message_chunk, (AIMessage, AIMessageChunk)) and message_chunk.content:
-                        data = json.dumps({"chunk": message_chunk.content})
-                        yield f"data: {data}\n\n"
+                        content = message_chunk.content
+                        content_str = ""
+                        if isinstance(content, str):
+                            content_str = content
+                        elif isinstance(content, list):
+                            content_str = "".join([item.get("text", "") for item in content if isinstance(item, dict) and item.get("type") == "text"])
+                        
+                        if content_str:
+                            data = json.dumps({"chunk": content_str})
+                            yield f"data: {data}\n\n"
                 
                 # Check graph state for interrupts
                 current_state = await chatbot.aget_state(config)
@@ -239,12 +247,13 @@ async def upload_pdf(thread_id: str = Form(...), file: UploadFile = File(...)):
         # Load and split PDF
         loader = PyPDFLoader(temp_file_path)
         documents = loader.load()
-        text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+        text_splitter = RecursiveCharacterTextSplitter(chunk_size=4000, chunk_overlap=400)
         splits = text_splitter.split_documents(documents)
         
         # Create or update FAISS index
         vectorstore_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vectorstores", thread_id)
-        embeddings = OllamaEmbeddings(model="nomic-embed-text")
+        from langchain_google_genai import GoogleGenerativeAIEmbeddings
+        embeddings = GoogleGenerativeAIEmbeddings(model="models/gemini-embedding-2")
         
         if os.path.exists(vectorstore_path):
             vectorstore = FAISS.load_local(vectorstore_path, embeddings, allow_dangerous_deserialization=True)
