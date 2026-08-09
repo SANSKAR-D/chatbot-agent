@@ -15,6 +15,7 @@ import asyncio
 import os
 from langchain_core.runnables import RunnableConfig
 from langchain_community.vectorstores import FAISS
+import pyfiglet
 load_dotenv()
 
 # -------------------
@@ -52,7 +53,7 @@ async def get_weather(city:str) -> dict:
 @tool
 async def purchase_stock(symbol: str, quantity: int) -> dict:
     """
-    Simulate purchasing a given quantity of a stock symbol.
+    Purchasing a given quantity of a stock symbol.
 
     NOTE: This is a mock implementation:
     - No real brokerage API is called.
@@ -105,7 +106,22 @@ async def search_pdf(query: str, config: RunnableConfig) -> str:
     except Exception as e:
         return f"Error searching PDF documents: {str(e)}"
 
-tools = [get_stock_price, purchase_stock, get_weather, search, search_pdf]
+@tool
+async def generate_ascii_art(text: str, font: str = "standard") -> str:
+    """
+    Generate ASCII art from a text string.
+    Input the text to convert, and optionally a font style (e.g. 'standard', 'slant', 'shadow', 'block', 'isometric1').
+    """
+    try:
+        # Fallback to standard font if requested font doesn't exist
+        if font not in pyfiglet.FigletFont.getFonts():
+            font = "standard"
+        ascii_art = pyfiglet.figlet_format(text, font=font)
+        return ascii_art
+    except Exception as e:
+        return f"Error generating ASCII art: {str(e)}"
+
+tools = [get_stock_price, purchase_stock, get_weather, search, search_pdf, generate_ascii_art]
 llm_with_tools = llm.bind_tools(tools)
 
 # -------------------
@@ -130,6 +146,7 @@ async def chat_node(state: ChatState):
             "3. If you do not know the answer to a question or are unsure, ALWAYS use the 'search' tool.\n"
             "4. Never say you don't have access to tools or real-time data.\n"
             "5. The user can upload PDF documents to this chat. You HAVE ACCESS to these documents via the 'search_pdf' tool. If the user asks about an uploaded document, PDF, notes, or its contents, you MUST use the 'search_pdf' tool to retrieve the information. NEVER say you cannot access or read documents.\n"
+            "6. If the user asks for ASCII art, a text banner, or stylized text, ALWAYS use the 'generate_ascii_art' tool. Do NOT attempt to construct ASCII art yourself.\n"
         )
     )
     response = await llm_with_tools.ainvoke([system_message] + messages)

@@ -10,3 +10,4 @@ faiss-cpu
 fastapi
 uvicorn
 langgraph-checkpoint-sqlite
+pyfiglet
