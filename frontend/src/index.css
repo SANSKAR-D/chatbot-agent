@@ -207,6 +207,29 @@ body {
   cursor: not-allowed;
 }
 
+.attach-btn {
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0.5rem;
+  border-radius: 50%;
+  transition: background-color 0.2s;
+  color: #e3e3e3;
+  margin-right: 0.5rem;
+}
+
+.attach-btn:hover {
+  background-color: #333537;
+}
+
+.attach-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
 .streaming-cursor {
   display: inline-block;
   width: 8px;
@@ -465,6 +488,16 @@ body {
   background: transparent;
   border: none;
   outline: none;
+}
+
+.chat-item svg {
+  flex-shrink: 0;
+}
+
+.chat-item span {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .chat-item-wrapper.active .chat-item {

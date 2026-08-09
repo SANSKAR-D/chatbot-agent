@@ -1,3 +1,4 @@
+from langchain_ollama import OllamaEmbeddings
 from langgraph.graph import StateGraph, START, END
 from typing import TypedDict, Annotated
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, AIMessageChunk, SystemMessage
@@ -12,6 +13,8 @@ from tavily import AsyncTavilyClient
 import httpx
 import asyncio
 import os
+from langchain_core.runnables import RunnableConfig
+from langchain_community.vectorstores import FAISS
 load_dotenv()
 
 # -------------------
@@ -74,7 +77,35 @@ async def search(query: str) -> dict:
     response = await tavily.search(query=query, max_results=5, search_depth="advanced")
     return response
 
-tools = [get_stock_price, purchase_stock,get_weather,search]
+@tool
+async def search_pdf(query: str, config: RunnableConfig) -> str:
+    """
+    Search the uploaded PDF documents for the current chat for relevant information.
+    Use this tool whenever the user asks questions about their uploaded PDF files, documents, or requests a summary or content extraction.
+    Input a descriptive search query based on what the user is asking. If they ask for a summary, query for 'summary or main topics'.
+    """
+    thread_id = config.get("configurable", {}).get("thread_id")
+    if not thread_id:
+        return "Error: No active chat thread ID found."
+    
+    vectorstore_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vectorstores", thread_id)
+    if not os.path.exists(vectorstore_path):
+        return "No PDF documents have been uploaded for this chat yet."
+    
+    try:
+        embeddings = OllamaEmbeddings(model="nomic-embed-text")
+        vectorstore = FAISS.load_local(vectorstore_path, embeddings, allow_dangerous_deserialization=True)
+        retriever = vectorstore.as_retriever(search_kwargs={"k": 5})
+        docs = await retriever.ainvoke(query)
+        
+        if not docs:
+            return "No relevant information found in the uploaded documents."
+            
+        return "\n\n".join([d.page_content for d in docs])
+    except Exception as e:
+        return f"Error searching PDF documents: {str(e)}"
+
+tools = [get_stock_price, purchase_stock, get_weather, search, search_pdf]
 llm_with_tools = llm.bind_tools(tools)
 
 # -------------------
@@ -91,13 +122,14 @@ async def chat_node(state: ChatState):
     messages = state["messages"]
     system_message = SystemMessage(
         content=(
-            "You are a helpful AI agent with access to real-time tools.\n"
+            "You are a helpful AI agent with access to real-time tools and uploaded documents.\n"
             "CRITICAL RULES:\n"
             "1. ALWAYS use the appropriate tool (get_weather, get_stock_price, search) if the user asks about real-time, "
             "current, historical, factual, or search-based topics (e.g. weather, stocks, places, events, facts, queries).\n"
             "2. Do NOT attempt to answer questions about external facts, current events, or real-time data from your own memory. You MUST call a tool.\n"
             "3. If you do not know the answer to a question or are unsure, ALWAYS use the 'search' tool.\n"
-            "4. Never say you don't have access to tools or real-time data."
+            "4. Never say you don't have access to tools or real-time data.\n"
+            "5. The user can upload PDF documents to this chat. You HAVE ACCESS to these documents via the 'search_pdf' tool. If the user asks about an uploaded document, PDF, notes, or its contents, you MUST use the 'search_pdf' tool to retrieve the information. NEVER say you cannot access or read documents.\n"
         )
     )
     response = await llm_with_tools.ainvoke([system_message] + messages)
@@ -129,7 +161,7 @@ graph = graph_builder.compile()
 # 7. Simple usage example (CLI)
 # -------------------
 async def main():
-    print("Stock Bot with Tools (get_stock_price, purchase_stock)")
+    print("Bot with Tools")
     print("Type 'exit' to quit.\n")
 
     # thread_id still works with MemorySaver (conversation kept in RAM)

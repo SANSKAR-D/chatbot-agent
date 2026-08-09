@@ -1,4 +1,4 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, File, UploadFile, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
@@ -11,6 +11,11 @@ from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
 from backend import graph_builder
 from langchain_core.messages import HumanMessage, AIMessage, AIMessageChunk
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_community.document_loaders import PyPDFLoader
+from langchain_community.vectorstores import FAISS
+from langchain_ollama import OllamaEmbeddings
+import shutil
 
 chatbot = None
 memory = None
@@ -146,6 +151,94 @@ async def get_threads():
         return {"threads": threads_list}
     except Exception as e:
         return {"threads": [], "error": str(e)}
+
+@app.delete("/chat/threads/{thread_id}")
+async def delete_thread(thread_id: str):
+    """
+    Delete a specific thread from the database.
+    """
+    try:
+        db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "chatbot.db")
+        async with aiosqlite.connect(db_path) as conn:
+            await conn.execute("DELETE FROM checkpoints WHERE thread_id = ?", (thread_id,))
+            await conn.execute("DELETE FROM writes WHERE thread_id = ?", (thread_id,))
+            await conn.commit()
+            
+        # Delete corresponding vector store if it exists
+        vectorstore_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vectorstores", thread_id)
+        if os.path.exists(vectorstore_path):
+            shutil.rmtree(vectorstore_path)
+            
+        return {"status": "success"}
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
+@app.delete("/chat/threads")
+async def clear_all_threads():
+    """
+    Delete all threads from the database.
+    """
+    try:
+        db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "chatbot.db")
+        async with aiosqlite.connect(db_path) as conn:
+            await conn.execute("DELETE FROM checkpoints")
+            await conn.execute("DELETE FROM writes")
+            await conn.commit()
+            
+        # Delete all vector stores
+        vectorstores_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vectorstores")
+        if os.path.exists(vectorstores_dir):
+            for item in os.listdir(vectorstores_dir):
+                item_path = os.path.join(vectorstores_dir, item)
+                if os.path.isdir(item_path):
+                    shutil.rmtree(item_path)
+                    
+        return {"status": "success"}
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
+@app.post("/upload-pdf")
+async def upload_pdf(thread_id: str = Form(...), file: UploadFile = File(...)):
+    """
+    Endpoint to upload a PDF file and vectorise it for a specific chat thread.
+    """
+    if not file.filename.endswith('.pdf'):
+        return {"status": "error", "message": "Only PDF files are allowed"}
+        
+    try:
+        # Save uploaded file temporarily
+        temp_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "temp")
+        os.makedirs(temp_dir, exist_ok=True)
+        temp_file_path = os.path.join(temp_dir, file.filename)
+        
+        with open(temp_file_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+            
+        # Load and split PDF
+        loader = PyPDFLoader(temp_file_path)
+        documents = loader.load()
+        text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+        splits = text_splitter.split_documents(documents)
+        
+        # Create or update FAISS index
+        vectorstore_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vectorstores", thread_id)
+        embeddings = OllamaEmbeddings(model="nomic-embed-text")
+        
+        if os.path.exists(vectorstore_path):
+            vectorstore = FAISS.load_local(vectorstore_path, embeddings, allow_dangerous_deserialization=True)
+            vectorstore.add_documents(splits)
+            vectorstore.save_local(vectorstore_path)
+        else:
+            os.makedirs(vectorstore_path, exist_ok=True)
+            vectorstore = FAISS.from_documents(splits, embeddings)
+            vectorstore.save_local(vectorstore_path)
+            
+        # Clean up temp file
+        os.remove(temp_file_path)
+        
+        return {"status": "success", "message": f"Successfully processed {len(splits)} chunks from {file.filename}."}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
 
 if __name__ == "__main__":
     import uvicorn
