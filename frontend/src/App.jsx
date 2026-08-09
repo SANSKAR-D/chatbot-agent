@@ -178,20 +178,8 @@ function App() {
     shouldScrollSmoothRef.current = true;
   }, [messages, isStreaming]);
 
-  const handleSubmit = async (e) => {
-    e.preventDefault();
-    if (!inputValue.trim() || isStreaming) return;
-
-    const userMessage = inputValue.trim();
-    setInputValue('');
-
-    // Add user message to UI
-    setMessages((prev) => [...prev, { text: userMessage, sender: 'user' }]);
-
-    // Add an empty bot message that we will append to during streaming
-    setMessages((prev) => [...prev, { text: '', sender: 'bot', isStreaming: true, isThinking: true }]);
+  const fetchStream = async (messageText, isResume = false) => {
     setIsStreaming(true);
-
     try {
       const response = await fetch('http://127.0.0.1:8000/chat/stream', {
         method: 'POST',
@@ -199,8 +187,9 @@ function App() {
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({
-          message: userMessage,
-          thread_id: activeChatId
+          message: messageText,
+          thread_id: activeChatId,
+          resume: isResume
         }),
       });
 
@@ -239,7 +228,22 @@ function App() {
 
             try {
               const data = JSON.parse(dataStr);
-              if (data.chunk) {
+              if (data.type === 'hitl_required') {
+                const toolCall = data.tool_calls[0];
+                setConfirmModal({
+                  isOpen: true,
+                  title: 'Approve Stock Purchase',
+                  message: `The AI is requesting to purchase ${toolCall.args.quantity} shares of ${toolCall.args.symbol}. Do you approve this transaction?`,
+                  confirmText: 'Approve',
+                  onConfirm: async () => {
+                    fetchStream('', 'approve');
+                  },
+                  onCancel: async () => {
+                    fetchStream('', 'reject');
+                  }
+                });
+                return; // Keep isStreaming true, break out of stream reading
+              } else if (data.chunk) {
                 setMessages((prev) => {
                   const newMessages = [...prev];
                   const lastIndex = newMessages.length - 1;
@@ -284,9 +288,21 @@ function App() {
         };
         return newMessages;
       });
-    } finally {
       setIsStreaming(false);
     }
+  };
+
+  const handleSubmit = async (e) => {
+    e.preventDefault();
+    if (!inputValue.trim() || isStreaming) return;
+
+    const userMessage = inputValue.trim();
+    setInputValue('');
+
+    setMessages((prev) => [...prev, { text: userMessage, sender: 'user' }]);
+    setMessages((prev) => [...prev, { text: '', sender: 'bot', isStreaming: true, isThinking: true }]);
+    
+    fetchStream(userMessage, false);
   };
 
   const handleFileUpload = async (e) => {
@@ -457,7 +473,10 @@ function App() {
           if (confirmModal.onConfirm) confirmModal.onConfirm();
           setConfirmModal(prev => ({ ...prev, isOpen: false }));
         }}
-        onCancel={() => setConfirmModal(prev => ({ ...prev, isOpen: false }))}
+        onCancel={() => {
+          if (confirmModal.onCancel) confirmModal.onCancel();
+          setConfirmModal(prev => ({ ...prev, isOpen: false }));
+        }}
       />
     </div>
   );

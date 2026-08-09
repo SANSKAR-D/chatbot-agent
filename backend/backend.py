@@ -9,6 +9,7 @@ from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode, tools_condition
 from langchain_core.tools import tool
 from dotenv import load_dotenv
+from langgraph.types import interrupt, Command
 from tavily import AsyncTavilyClient
 import httpx
 import asyncio
@@ -59,6 +60,10 @@ async def purchase_stock(symbol: str, quantity: int) -> dict:
     - No real brokerage API is called.
     - It simply returns a confirmation payload.
     """
+    response = interrupt({"action": "purchase_stock", "symbol": symbol, "quantity": quantity})
+    if response == "reject":
+        return {"status": "error", "message": "User rejected the purchase."}
+        
     await asyncio.sleep(0.1)
     return {
         "status": "success",
@@ -186,6 +191,7 @@ async def main():
 
     async with AsyncSqliteSaver.from_conn_string("chatbot.db") as memory:
         chatbot = graph_builder.compile(checkpointer=memory)
+        config = {"configurable": {"thread_id": thread_id}}
         
         while True:
             user_input = input("You: ")
@@ -196,14 +202,31 @@ async def main():
             # Build initial state for this turn
             state = {"messages": [HumanMessage(content=user_input)]}
 
-            async for message_chunk, meta_data in chatbot.astream(
-                state,
-                config={"configurable": {"thread_id": thread_id}},
-                stream_mode='messages'
-            ):
-                if isinstance(message_chunk, (AIMessage, AIMessageChunk)) and message_chunk.content:
-                    print(message_chunk.content, end="",flush = True)
-            print("")
+            while True:
+                async for message_chunk, meta_data in chatbot.astream(
+                    state,
+                    config=config,
+                    stream_mode='messages'
+                ):
+                    if isinstance(message_chunk, (AIMessage, AIMessageChunk)) and message_chunk.content:
+                        print(message_chunk.content, end="",flush = True)
+                
+                # Check for interrupts
+                current_state = await chatbot.aget_state(config)
+                if current_state.tasks and current_state.tasks[0].interrupts:
+                    interrupt_val = current_state.tasks[0].interrupts[0].value
+                    if isinstance(interrupt_val, dict) and interrupt_val.get("action") == "purchase_stock":
+                        print(f"\n[SYSTEM]: The AI wants to purchase {interrupt_val['quantity']} shares of {interrupt_val['symbol']}. Approve? (yes/no): ", end="")
+                        ans = input()
+                        if ans.lower().strip() in {"y", "yes"}:
+                            state = Command(resume="approve")
+                        else:
+                            state = Command(resume="reject")
+                    else:
+                        state = None
+                else:
+                    print("")
+                    break
 
 if __name__ == "__main__":
     asyncio.run(main())

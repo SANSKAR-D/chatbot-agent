@@ -40,16 +40,19 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+from langgraph.types import Command
+
 class ChatRequest(BaseModel):
-    message: str
+    message: str | None = None
     thread_id: str = "demo-thread"
+    resume: str | bool | None = None
 
 @app.post("/chat")
 async def chat_endpoint(request: ChatRequest):
     """
     Standard JSON endpoint for non-streaming (fallback)
     """
-    state = {"messages": [HumanMessage(content=request.message)]}
+    state = Command(resume=request.resume) if request.resume else {"messages": [HumanMessage(content=request.message)]}
     config = {"configurable": {"thread_id": request.thread_id}}
     
     final_response = ""
@@ -62,17 +65,35 @@ async def chat_endpoint(request: ChatRequest):
 @app.post("/chat/stream")
 async def chat_stream_endpoint(request: ChatRequest):
     """
-    Server-Sent Events endpoint for streaming
+    Server-Sent Events endpoint for streaming with HITL support
     """
     async def event_generator():
-        state = {"messages": [HumanMessage(content=request.message)]}
+        state = Command(resume=request.resume) if request.resume else {"messages": [HumanMessage(content=request.message)]}
         config = {"configurable": {"thread_id": request.thread_id}}
         
         try:
-            async for message_chunk, meta_data in chatbot.astream(state, config=config, stream_mode='messages'):
-                if isinstance(message_chunk, (AIMessage, AIMessageChunk)) and message_chunk.content:
-                    data = json.dumps({"chunk": message_chunk.content})
-                    yield f"data: {data}\n\n"
+            while True:
+                async for message_chunk, meta_data in chatbot.astream(state, config=config, stream_mode='messages'):
+                    if isinstance(message_chunk, (AIMessage, AIMessageChunk)) and message_chunk.content:
+                        data = json.dumps({"chunk": message_chunk.content})
+                        yield f"data: {data}\n\n"
+                
+                # Check graph state for interrupts
+                current_state = await chatbot.aget_state(config)
+                if current_state.tasks and current_state.tasks[0].interrupts:
+                    interrupt_val = current_state.tasks[0].interrupts[0].value
+                    if isinstance(interrupt_val, dict) and interrupt_val.get("action") == "purchase_stock":
+                        # Yield HITL event and pause execution
+                        hitl_data = json.dumps({
+                            "type": "hitl_required", 
+                            "tool_calls": [{"args": {"symbol": interrupt_val["symbol"], "quantity": interrupt_val["quantity"]}}]
+                        })
+                        yield f"data: {hitl_data}\n\n"
+                        break
+                    else:
+                        state = None
+                else:
+                    break
         except Exception as e:
             error_data = json.dumps({"error": str(e)})
             yield f"data: {error_data}\n\n"
@@ -80,6 +101,7 @@ async def chat_stream_endpoint(request: ChatRequest):
         yield "data: [DONE]\n\n"
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
+
 
 @app.get("/chat/history/{thread_id}")
 async def get_chat_history(thread_id: str):
