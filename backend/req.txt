@@ -9,5 +9,7 @@ markdown
 faiss-cpu
 fastapi
 uvicorn
-langgraph-checkpoint-sqlite
+langgraph-checkpoint-postgres
+psycopg-binary
+psycopg_pool
 pyfiglet

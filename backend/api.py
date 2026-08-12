@@ -5,29 +5,42 @@ from pydantic import BaseModel
 import json
 import asyncio
 import os
-import aiosqlite
+from psycopg_pool import AsyncConnectionPool
 from contextlib import asynccontextmanager
-from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 
 from backend import graph_builder
 from langchain_core.messages import HumanMessage, AIMessage, AIMessageChunk
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_community.vectorstores import FAISS
-from langchain_ollama import OllamaEmbeddings
 import shutil
 
 chatbot = None
 memory = None
+pool = None
+DB_URI = os.getenv("DATABASE_URL")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global chatbot, memory
-    db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "chatbot.db")
-    async with AsyncSqliteSaver.from_conn_string(db_path) as saver:
-        memory = saver
-        chatbot = graph_builder.compile(checkpointer=memory)
-        yield
+    global chatbot, memory, pool
+    
+    pool = AsyncConnectionPool(
+        conninfo=DB_URI,
+        kwargs={"autocommit": True},
+        open=False,
+    )
+    await pool.open()
+    
+    checkpointer = AsyncPostgresSaver(pool)
+    await checkpointer.setup()
+    
+    memory = checkpointer
+    chatbot = graph_builder.compile(checkpointer=memory)
+    
+    yield
+    
+    await pool.close()
 
 app = FastAPI(lifespan=lifespan)
 
@@ -57,8 +70,9 @@ async def chat_endpoint(request: ChatRequest):
     
     final_response = ""
     async for message_chunk, meta_data in chatbot.astream(state, config=config, stream_mode='messages'):
-        if isinstance(message_chunk, (AIMessage, AIMessageChunk)) and message_chunk.content:
-            final_response += message_chunk.content
+        if meta_data.get("langgraph_node") == "chat_node":
+            if isinstance(message_chunk, (AIMessage, AIMessageChunk)) and message_chunk.content:
+                final_response += message_chunk.content
             
     return {"response": final_response}
 
@@ -74,17 +88,18 @@ async def chat_stream_endpoint(request: ChatRequest):
         try:
             while True:
                 async for message_chunk, meta_data in chatbot.astream(state, config=config, stream_mode='messages'):
-                    if isinstance(message_chunk, (AIMessage, AIMessageChunk)) and message_chunk.content:
-                        content = message_chunk.content
-                        content_str = ""
-                        if isinstance(content, str):
-                            content_str = content
-                        elif isinstance(content, list):
-                            content_str = "".join([item.get("text", "") for item in content if isinstance(item, dict) and item.get("type") == "text"])
-                        
-                        if content_str:
-                            data = json.dumps({"chunk": content_str})
-                            yield f"data: {data}\n\n"
+                    if meta_data.get("langgraph_node") == "chat_node":
+                        if isinstance(message_chunk, (AIMessage, AIMessageChunk)) and message_chunk.content:
+                            content = message_chunk.content
+                            content_str = ""
+                            if isinstance(content, str):
+                                content_str = content
+                            elif isinstance(content, list):
+                                content_str = "".join([item.get("text", "") for item in content if isinstance(item, dict) and item.get("type") == "text"])
+                            
+                            if content_str:
+                                data = json.dumps({"chunk": content_str})
+                                yield f"data: {data}\n\n"
                 
                 # Check graph state for interrupts
                 current_state = await chatbot.aget_state(config)
@@ -147,15 +162,13 @@ async def get_chat_history(thread_id: str):
 @app.get("/chat/threads")
 async def get_threads():
     """
-    Retrieve all unique thread_ids from SQLite checkpoints table and generate titles.
+    Retrieve all unique thread_ids from Postgres checkpoints table and generate titles.
     """
     try:
-        # Resolve the database path
-        db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "chatbot.db")
-        
         # Connect and query unique thread IDs
-        async with aiosqlite.connect(db_path) as conn:
-            async with conn.execute("SELECT DISTINCT thread_id FROM checkpoints") as cursor:
+        async with pool.connection() as conn:
+            async with conn.cursor() as cursor:
+                await cursor.execute("SELECT DISTINCT thread_id FROM checkpoints")
                 rows = await cursor.fetchall()
                 thread_ids = [row[0] for row in rows]
         
@@ -188,10 +201,10 @@ async def delete_thread(thread_id: str):
     Delete a specific thread from the database.
     """
     try:
-        db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "chatbot.db")
-        async with aiosqlite.connect(db_path) as conn:
-            await conn.execute("DELETE FROM checkpoints WHERE thread_id = ?", (thread_id,))
-            await conn.execute("DELETE FROM writes WHERE thread_id = ?", (thread_id,))
+        async with pool.connection() as conn:
+            async with conn.cursor() as cursor:
+                await cursor.execute("DELETE FROM checkpoints WHERE thread_id = %s", (thread_id,))
+                await cursor.execute("DELETE FROM writes WHERE thread_id = %s", (thread_id,))
             await conn.commit()
             
         # Delete corresponding vector store if it exists
@@ -209,10 +222,10 @@ async def clear_all_threads():
     Delete all threads from the database.
     """
     try:
-        db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "chatbot.db")
-        async with aiosqlite.connect(db_path) as conn:
-            await conn.execute("DELETE FROM checkpoints")
-            await conn.execute("DELETE FROM writes")
+        async with pool.connection() as conn:
+            async with conn.cursor() as cursor:
+                await cursor.execute("DELETE FROM checkpoints")
+                await cursor.execute("DELETE FROM writes")
             await conn.commit()
             
         # Delete all vector stores
