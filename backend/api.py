@@ -8,22 +8,24 @@ import os
 from psycopg_pool import AsyncConnectionPool
 from contextlib import asynccontextmanager
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
-
+from langgraph.store.postgres.aio import AsyncPostgresStore
 from backend import graph_builder
 from langchain_core.messages import HumanMessage, AIMessage, AIMessageChunk
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_community.vectorstores import FAISS
+from langchain_google_genai import GoogleGenerativeAIEmbeddings
 import shutil
 
 chatbot = None
 memory = None
+store = None
 pool = None
 DB_URI = os.getenv("DATABASE_URL")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global chatbot, memory, pool
+    global chatbot, memory, store, pool
     
     pool = AsyncConnectionPool(
         conninfo=DB_URI,
@@ -35,8 +37,14 @@ async def lifespan(app: FastAPI):
     checkpointer = AsyncPostgresSaver(pool)
     await checkpointer.setup()
     
+    # Initialize LTM store with semantic search index
+    from langchain_ollama import OllamaEmbeddings
+    embeddings = OllamaEmbeddings(model="nomic-embed-text")
+    store = AsyncPostgresStore(pool, index={"embed": embeddings, "dims": 768})
+    await store.setup()
+    
     memory = checkpointer
-    chatbot = graph_builder.compile(checkpointer=memory)
+    chatbot = graph_builder.compile(checkpointer=memory, store=store)
     
     yield
     
@@ -58,6 +66,7 @@ from langgraph.types import Command
 class ChatRequest(BaseModel):
     message: str | None = None
     thread_id: str = "demo-thread"
+    user_id: str = "default_user"
     resume: str | bool | None = None
 
 @app.post("/chat")
@@ -66,7 +75,7 @@ async def chat_endpoint(request: ChatRequest):
     Standard JSON endpoint for non-streaming (fallback)
     """
     state = Command(resume=request.resume) if request.resume else {"messages": [HumanMessage(content=request.message)]}
-    config = {"configurable": {"thread_id": request.thread_id}}
+    config = {"configurable": {"thread_id": request.thread_id, "user_id": request.user_id}}
     
     final_response = ""
     async for message_chunk, meta_data in chatbot.astream(state, config=config, stream_mode='messages'):
@@ -83,7 +92,7 @@ async def chat_stream_endpoint(request: ChatRequest):
     """
     async def event_generator():
         state = Command(resume=request.resume) if request.resume else {"messages": [HumanMessage(content=request.message)]}
-        config = {"configurable": {"thread_id": request.thread_id}}
+        config = {"configurable": {"thread_id": request.thread_id, "user_id": request.user_id}}
         
         try:
             while True:
@@ -142,16 +151,23 @@ async def get_chat_history(thread_id: str):
         # Format messages for the frontend
         formatted_messages = []
         for msg in messages:
+            content = msg.content
+            content_str = ""
+            if isinstance(content, str):
+                content_str = content
+            elif isinstance(content, list):
+                content_str = "".join([item.get("text", "") for item in content if isinstance(item, dict) and item.get("type") == "text"])
+                
             if isinstance(msg, HumanMessage):
                 formatted_messages.append({
-                    "text": msg.content,
+                    "text": content_str,
                     "sender": "user"
                 })
             elif isinstance(msg, AIMessage):
                 # Ensure we only include messages with content (skip empty tool calls/responses)
-                if msg.content:
+                if content_str:
                     formatted_messages.append({
-                        "text": msg.content,
+                        "text": content_str,
                         "sender": "bot"
                     })
                     
@@ -183,8 +199,15 @@ async def get_threads():
             title = "New Chat"
             for msg in messages:
                 if isinstance(msg, HumanMessage) and msg.content:
-                    title = msg.content[:30] + ("..." if len(msg.content) > 30 else "")
-                    break
+                    content_str = ""
+                    if isinstance(msg.content, str):
+                        content_str = msg.content
+                    elif isinstance(msg.content, list):
+                        content_str = "".join([item.get("text", "") for item in msg.content if isinstance(item, dict) and item.get("type") == "text"])
+                        
+                    if content_str:
+                        title = content_str[:30] + ("..." if len(content_str) > 30 else "")
+                        break
                     
             threads_list.append({
                 "id": t_id,
@@ -287,3 +310,9 @@ async def upload_pdf(thread_id: str = Form(...), file: UploadFile = File(...)):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="127.0.0.1", port=os.getenv("PORT", 8000))
+
+
+
+
+
+

@@ -10,10 +10,13 @@ from langgraph.prebuilt import ToolNode, tools_condition
 from langchain_core.tools import tool
 from dotenv import load_dotenv
 from langgraph.types import interrupt, Command
+from langgraph.store.base import BaseStore
+from langgraph.prebuilt import InjectedStore
 from tavily import AsyncTavilyClient
 import httpx
 import asyncio
 import os
+import uuid
 from langchain_core.runnables import RunnableConfig
 from langchain_community.vectorstores import FAISS
 import pyfiglet
@@ -128,7 +131,40 @@ async def generate_ascii_art(text: str, font: str = "standard") -> str:
     except Exception as e:
         return f"Error generating ASCII art: {str(e)}"
 
-tools = [get_stock_price, purchase_stock, get_weather, search, search_pdf, generate_ascii_art]
+@tool
+async def save_user_memory(
+    fact: str,
+    config: RunnableConfig,
+    store: Annotated[BaseStore, InjectedStore()]
+) -> str:
+    """
+    Save a user preference, name, location, or any personal fact to long-term memory.
+    You MUST call this tool proactively whenever the user shares information about themselves, 
+    their interests, their life, or how they like to be addressed. 
+    This allows you to build a personalized profile over time.
+    """
+    user_id = config.get("configurable", {}).get("user_id", "default_user")
+    namespace = ("user_profile", user_id)
+    
+    # Check for duplicates using semantic search
+    existing = await store.asearch(namespace, query=fact, limit=3)
+    for mem in existing:
+        existing_fact = mem.value.get("fact", "")
+        # Exact string match check
+        if existing_fact.lower() == fact.lower():
+            return "Fact already known (exact duplicate)."
+        
+        # Semantic similarity check (distance near 0 or similarity near 1)
+        if hasattr(mem, 'score') and mem.score is not None:
+            if mem.score < 0.15 or mem.score > 0.85:
+                return f"Fact already known (semantically similar to: {existing_fact})."
+    
+    # Save the new fact as a distinct item for vectorization
+    fact_id = str(uuid.uuid4())
+    await store.aput(namespace, fact_id, {"fact": fact})
+    return f"Successfully saved fact: {fact}"
+
+tools = [get_stock_price, purchase_stock, get_weather, search, search_pdf, generate_ascii_art, save_user_memory]
 llm_with_tools = llm.bind_tools(tools)
 
 # -------------------
@@ -185,7 +221,7 @@ async def summarize_node(state: ChatState):
         }
     return {}
 
-async def chat_node(state: ChatState):
+async def chat_node(state: ChatState, config: RunnableConfig, store: BaseStore):
     """LLM node that may answer or request a tool call."""
     messages = state["messages"]
     summary = state.get("summary", "")
@@ -194,18 +230,36 @@ async def chat_node(state: ChatState):
     active_messages = messages[summarized_count:]
     
     sys_content = (
-        "You are a helpful AI agent with access to real-time tools and uploaded documents.\n"
-        "CRITICAL RULES:\n"
-        "1. ALWAYS use the appropriate tool (get_weather, get_stock_price, search) if the user asks about real-time, "
-        "current, historical, factual, or search-based topics (e.g. weather, stocks, places, events, facts, queries).\n"
-        "2. Do NOT attempt to answer questions about external facts, current events, or real-time data from your own memory. You MUST call a tool.\n"
-        "3. If you do not know the answer to a question or are unsure, ALWAYS use the 'search' tool.\n"
-        "4. Never say you don't have access to tools or real-time data.\n"
-        "5. The user can upload PDF documents to this chat. You HAVE ACCESS to these documents via the 'search_pdf' tool. If the user asks about an uploaded document, PDF, notes, or its contents, you MUST use the 'search_pdf' tool to retrieve the information. NEVER say you cannot access or read documents.\n"
-        "6. If the user asks for ASCII art, a text banner, or stylized text, ALWAYS use the 'generate_ascii_art' tool. Do NOT attempt to construct ASCII art yourself.\n"
+        "You are an advanced, highly personalized AI assistant. Your primary goal is to be exceptionally helpful while building a warm, ongoing relationship with the user.\n\n"
+        "--- CAPABILITIES & TOOLS ---\n"
+        "- You have real-time access to the internet, weather, stocks, and the user's uploaded PDFs. NEVER say you lack access to real-time data or documents.\n"
+        "- If a question requires current facts, external knowledge, or real-time data, you MUST use the 'search', 'get_weather', or 'get_stock_price' tools. Do not guess.\n"
+        "- For PDF or document-related questions, ALWAYS use 'search_pdf'.\n"
+        "- For ASCII art requests, use 'generate_ascii_art'. Do not draw it yourself.\n"
+        "- When presenting stock prices or financial data, ensure your markdown formatting is perfectly clean. Do NOT split bold text or italics across newlines, and DO NOT insert errant asterisks.\n\n"
+        "--- PERSONALIZATION & BEHAVIOR ---\n"
+        "1. PROACTIVE MEMORY: You are equipped with a Long-Term Memory tool ('save_user_memory'). You MUST actively listen for new facts about the user (name, location, hobbies, job, preferences) and call this tool in the background to save them.\n"
+        "2. TAILORED RESPONSES: Use the 'USER PROFILE & LONG-TERM MEMORY' facts (provided below) to customize your answers. Greet them by name, tie answers back to their interests natively, and match their preferred tone.\n"
+        "3. NATURAL CONVERSATION: Be conversational and friendly. Do not be overly robotic or constantly remind the user you are an AI.\n"
     )
     if summary:
         sys_content += f"\n\nSummary of older conversation:\n{summary}"
+        
+    user_id = config.get("configurable", {}).get("user_id", "default_user")
+    namespace = ("user_profile", user_id)
+    
+    # Use the latest user message to run a semantic search against the user's memories
+    query = active_messages[-1].content if active_messages else ""
+    memories = await store.asearch(namespace, query=query, limit=5)
+    
+    if memories:
+        sys_content += "\n\n--- USER PROFILE & LONG-TERM MEMORY ---\n"
+        sys_content += "Use these highly relevant facts to craft personalized responses:\n"
+        for mem in memories:
+            fact = mem.value.get("fact", "")
+            if fact:
+                sys_content += f"- {fact}\n"
+        sys_content += "---------------------------------------\n"
         
     system_message = SystemMessage(content=sys_content)
     
@@ -242,64 +296,3 @@ graph_builder.add_edge("tools", "chat_node")
 
 # We export graph_builder so we can compile it with async memory in api.py
 graph = graph_builder.compile()
-
-# -------------------
-# 7. Simple usage example (CLI)
-# -------------------
-async def main():
-    print("Bot with Tools")
-    print("Type 'exit' to quit.\n")
-
-    thread_id = "demo-thread"
-    db_uri = os.getenv("DATABASE_URL", "postgresql://postgres:password@localhost:5432/chatbot_db")
-    pool = AsyncConnectionPool(
-        conninfo=db_uri,
-        kwargs={"autocommit": True},
-        open=False,
-    )
-    await pool.open()
-
-    checkpointer = AsyncPostgresSaver(pool)
-    await checkpointer.setup()
-
-    chatbot = graph_builder.compile(checkpointer=checkpointer)
-    config = {"configurable": {"thread_id": thread_id}}
-    
-    while True:
-        user_input = input("You: ")
-        if user_input.lower().strip() in {"exit", "quit"}:
-            print("Goodbye!")
-            break
-
-        state = {"messages": [HumanMessage(content=user_input)]}
-
-        while True:
-            async for message_chunk, meta_data in chatbot.astream(
-                state,
-                config=config,
-                stream_mode='messages'
-            ):
-                if meta_data.get("langgraph_node") == "chat_node":
-                    if isinstance(message_chunk, (AIMessage, AIMessageChunk)) and message_chunk.content:
-                        print(message_chunk.content, end="",flush = True)
-            
-            current_state = await chatbot.aget_state(config)
-            if current_state.tasks and current_state.tasks[0].interrupts:
-                interrupt_val = current_state.tasks[0].interrupts[0].value
-                if isinstance(interrupt_val, dict) and interrupt_val.get("action") == "purchase_stock":
-                    print(f"\n[SYSTEM]: The AI wants to purchase {interrupt_val['quantity']} shares of {interrupt_val['symbol']}. Approve? (yes/no): ", end="")
-                    ans = input()
-                    if ans.lower().strip() in {"y", "yes"}:
-                        state = Command(resume="approve")
-                    else:
-                        state = Command(resume="reject")
-                else:
-                    state = None
-            else:
-                print("")
-                break
-                
-    await pool.close()
-
-if __name__ == "__main__":
-    asyncio.run(main())
