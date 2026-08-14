@@ -13,3 +13,5 @@ langgraph-checkpoint-postgres
 psycopg-binary
 psycopg_pool
 pyfiglet
+langchain_tavily
+huggingface_hub
