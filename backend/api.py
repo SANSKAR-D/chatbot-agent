@@ -12,12 +12,14 @@ from langgraph.store.postgres.aio import AsyncPostgresStore
 from backend import graph_builder
 from langchain_core.messages import HumanMessage, AIMessage, AIMessageChunk
 from langchain_text_splitters import RecursiveCharacterTextSplitter
+from blog import graph as blog_graph
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_community.vectorstores import FAISS
 from langchain_google_genai import GoogleGenerativeAIEmbeddings
 import shutil
 
 chatbot = None
+blog_bot = None
 memory = None
 store = None
 pool = None
@@ -25,7 +27,7 @@ DB_URI = os.getenv("DATABASE_URL")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global chatbot, memory, store, pool
+    global chatbot, blog_bot, memory, store, pool
     
     pool = AsyncConnectionPool(
         conninfo=DB_URI,
@@ -34,7 +36,19 @@ async def lifespan(app: FastAPI):
     )
     await pool.open()
     
-    checkpointer = AsyncPostgresSaver(pool)
+    from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
+    serde = JsonPlusSerializer(
+        allowed_msgpack_modules=[
+            ("blog", "Plan"),
+            ("blog", "GlobalImagePlan"),
+            ("blog", "RouterDecision"),
+            ("blog", "Task"),
+            ("blog", "ImageSpec"),
+            ("blog", "EvidencePack"),
+            ("blog", "EvidenceItem"),
+        ]
+    )
+    checkpointer = AsyncPostgresSaver(pool, serde=serde)
     await checkpointer.setup()
     
     # Initialize LTM store with semantic search index
@@ -45,12 +59,23 @@ async def lifespan(app: FastAPI):
     
     memory = checkpointer
     chatbot = graph_builder.compile(checkpointer=memory, store=store)
+    blog_bot = blog_graph.compile(checkpointer=memory)
     
     yield
     
     await pool.close()
 
 app = FastAPI(lifespan=lifespan)
+
+from fastapi.staticfiles import StaticFiles
+
+class NoCacheStaticFiles(StaticFiles):
+    async def get_response(self, path: str, scope):
+        response = await super().get_response(path, scope)
+        response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Expires"] = "0"
+        return response
 
 # Allow CORS for the React frontend
 app.add_middleware(
@@ -61,6 +86,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Mount blogs directory for static file serving (images)
+blogs_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "blogs")
+os.makedirs(blogs_dir, exist_ok=True)
+app.mount("/blogs", NoCacheStaticFiles(directory=blogs_dir), name="blogs")
+
 from langgraph.types import Command
 
 class ChatRequest(BaseModel):
@@ -68,6 +98,13 @@ class ChatRequest(BaseModel):
     thread_id: str = "demo-thread"
     user_id: str = "default_user"
     resume: str | bool | None = None
+
+class BlogRequest(BaseModel):
+    topic: str
+    thread_id: str = "demo-blog-thread"
+    user_id: str = "default_user"
+    feedback: str | None = None
+
 
 @app.post("/chat")
 async def chat_endpoint(request: ChatRequest):
@@ -184,7 +221,7 @@ async def get_threads():
         # Connect and query unique thread IDs
         async with pool.connection() as conn:
             async with conn.cursor() as cursor:
-                await cursor.execute("SELECT DISTINCT thread_id FROM checkpoints")
+                await cursor.execute("SELECT DISTINCT thread_id FROM checkpoints WHERE thread_id LIKE 'chat_%'")
                 rows = await cursor.fetchall()
                 thread_ids = [row[0] for row in rows]
         
@@ -247,8 +284,8 @@ async def clear_all_threads():
     try:
         async with pool.connection() as conn:
             async with conn.cursor() as cursor:
-                await cursor.execute("DELETE FROM checkpoints")
-                await cursor.execute("DELETE FROM writes")
+                await cursor.execute("DELETE FROM checkpoints WHERE thread_id LIKE 'chat_%'")
+                await cursor.execute("DELETE FROM writes WHERE thread_id LIKE 'chat_%'")
             await conn.commit()
             
         # Delete all vector stores
@@ -306,6 +343,107 @@ async def upload_pdf(thread_id: str = Form(...), file: UploadFile = File(...)):
         return {"status": "success", "message": f"Successfully processed {len(splits)} chunks from {file.filename}."}
     except Exception as e:
         return {"status": "error", "message": str(e)}
+
+@app.post("/blog/stream")
+async def blog_stream_endpoint(request: BlogRequest):
+    """
+    Server-Sent Events endpoint for streaming blog generation updates
+    """
+    async def event_generator():
+        state = {"topic": request.topic}
+        if request.feedback:
+            state["feedback"] = request.feedback
+        config = {"configurable": {"thread_id": request.thread_id, "user_id": request.user_id}}
+        
+        try:
+            async for chunk in blog_bot.astream(state, config=config, stream_mode='updates'):
+                for node_name, state_update in chunk.items():
+                    data_payload = {"node": node_name}
+                    
+                    if node_name == "router_node":
+                        data_payload["message"] = "Deciding if research is needed..."
+                    elif node_name == "research_node":
+                        data_payload["message"] = "Researching topic on the web..."
+                    elif node_name == "orchestrator":
+                        data_payload["message"] = "Creating blog outline and plan..."
+                    elif node_name == "worker":
+                        data_payload["message"] = "Writing section..."
+                    elif node_name == "refine_node":
+                        data_payload["message"] = "Revising blog post based on your feedback..."
+                    elif node_name == "reducer" or node_name == "merge_content" or node_name == "decide_images" or node_name == "generate_and_place_images":
+                        data_payload["message"] = f"Reducer ({node_name}): Formatting and generating images..."
+                        if "final" in state_update:
+                            data_payload["final_markdown"] = state_update["final"]
+                    
+                    yield f"data: {json.dumps(data_payload)}\n\n"
+                    
+        except Exception as e:
+            error_data = json.dumps({"error": str(e)})
+            yield f"data: {error_data}\n\n"
+            
+        yield "data: [DONE]\n\n"
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+@app.get("/blog/threads")
+async def get_blog_threads():
+    try:
+        async with pool.connection() as conn:
+            async with conn.cursor() as cursor:
+                await cursor.execute("SELECT DISTINCT thread_id FROM checkpoints WHERE thread_id LIKE 'blog_%'")
+                rows = await cursor.fetchall()
+                thread_ids = [row[0] for row in rows]
+        
+        threads_list = []
+        for t_id in thread_ids:
+            config = {"configurable": {"thread_id": t_id}}
+            state = await blog_bot.aget_state(config)
+            topic = state.values.get("topic", "New Blog")
+            title = topic[:30] + ("..." if len(topic) > 30 else "")
+            
+            threads_list.append({
+                "id": t_id,
+                "title": title
+            })
+            
+        return {"threads": threads_list}
+    except Exception as e:
+        return {"threads": [], "error": str(e)}
+
+@app.get("/blog/history/{thread_id}")
+async def get_blog_history(thread_id: str):
+    config = {"configurable": {"thread_id": thread_id}}
+    try:
+        state = await blog_bot.aget_state(config)
+        final = state.values.get("final", "")
+        topic = state.values.get("topic", "")
+        return {"topic": topic, "final_markdown": final}
+    except Exception as e:
+        return {"error": str(e)}
+
+@app.delete("/blog/threads/{thread_id}")
+async def delete_blog_thread(thread_id: str):
+    try:
+        async with pool.connection() as conn:
+            async with conn.cursor() as cursor:
+                await cursor.execute("DELETE FROM checkpoints WHERE thread_id = %s", (thread_id,))
+                await cursor.execute("DELETE FROM writes WHERE thread_id = %s", (thread_id,))
+            await conn.commit()
+        return {"status": "success"}
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
+@app.delete("/blog/threads")
+async def clear_all_blog_threads():
+    try:
+        async with pool.connection() as conn:
+            async with conn.cursor() as cursor:
+                await cursor.execute("DELETE FROM checkpoints WHERE thread_id LIKE 'blog_%'")
+                await cursor.execute("DELETE FROM writes WHERE thread_id LIKE 'blog_%'")
+            await conn.commit()
+        return {"status": "success"}
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
 
 if __name__ == "__main__":
     import uvicorn

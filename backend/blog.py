@@ -61,6 +61,7 @@ class GlobalImagePlan(BaseModel):
 
 class State(TypedDict, total=False):
     topic : str
+    feedback: Optional[str]
     router_decision: RouterDecision
     evidence: EvidencePack
     plan : Plan
@@ -144,7 +145,7 @@ def orchestrator(state:State):
             - Should be engaging and make people want to click
 
             Blog Section Requirements:
-            - 2-3 sections depending on the topic
+            - 3-4 sections depending on the topic
             - Each section should have a clear heading
             - Each section should be 300-500 words long
             - Each section should include the primary keyword naturally
@@ -262,38 +263,108 @@ def decide_images(state: State):
 import os
 from huggingface_hub import InferenceClient
 
+REFINE_SYSTEM = """You are a senior technical writer and blog editor.
+
+Your task is to refine and update an existing full blog post based on user feedback.
+
+STRICT WRITING RULES:
+1. PRESERVE FULL LENGTH AND DEPTH: Do NOT truncate, summarize, or remove detailed technical sections from the existing blog post unless explicitly requested in the user's feedback.
+2. INTEGRATE USER FEEDBACK: Incorporate all user feedback (e.g. adding new topics, expanding explanations, adding code examples, adjusting tone) directly into the appropriate sections of the post.
+3. STRUCTURE & FORMATTING: Maintain clean Markdown structure with clear H1, H2, and H3 headings, code blocks, bold text, and bullet points.
+4. IMAGE PLACEHOLDERS: Keep or adjust image placeholders like [[IMAGE_1]], [[IMAGE_2]] in natural positions where visual diagrams are helpful.
+5. Output ONLY the updated complete Markdown document. Do not include introductory comments or meta-explanations.
+"""
+
+def refine_node(state: State):
+    current_draft = state.get("final") or state.get("merged_md") or ""
+    feedback = state.get("feedback") or ""
+    topic = state.get("topic") or ""
+
+    response = llm.invoke([
+        SystemMessage(content=REFINE_SYSTEM),
+        HumanMessage(content=(
+            f"Original Topic: {topic}\n\n"
+            f"User Feedback / Adjustments Required:\n{feedback}\n\n"
+            f"Current Blog Post Draft:\n{current_draft}\n\n"
+            "Produce the complete, fully updated Markdown blog post incorporating the feedback while maintaining full length, detailed sections, and high quality."
+        ))
+    ])
+    
+    content = response.content
+    if isinstance(content, list):
+        revised_md = "".join(block if isinstance(block, str) else block.get("text", "") for block in content).strip()
+    else:
+        revised_md = content.strip()
+
+    return {"merged_md": revised_md}
+
+import base64
+import time
+import requests
+
 def generate_and_place_images(state: State):
-    plan = state["plan"]
     image_plan = state["image_plan"]
     
     final_md = image_plan.md_with_placeholders
     
+    cf_account_id = os.environ.get("ACCOUNT_ID")
+    cf_token = os.environ.get("CLOUDFLARE_TOKEN")
     hf_token = os.environ.get("HF_TOKEN")
-    client = InferenceClient(model="black-forest-labs/FLUX.1-schnell", token=hf_token) if hf_token else None
     
     output_path = Path(__file__).parent / "blogs"
     output_path.mkdir(exist_ok=True)
     
     import re
-    safe_title = re.sub(r'[^\w\s-]', '', plan.blog_title.lower())
+    blog_title = state["plan"].blog_title if ("plan" in state and state["plan"]) else state.get("topic", "blog")
+    safe_title = re.sub(r'[^\w\s-]', '', blog_title.lower())
     base_filename = safe_title.replace(" ", "-")
+    
+    ts = int(time.time())
     
     for spec in image_plan.images:
         image_filename = f"{base_filename}-{spec.filename}"
         if not image_filename.endswith('.png'):
             image_filename += '.png'
             
-        if client:
-            try:
-                print(f"Generating image for prompt: {spec.prompt}")
-                image = client.text_to_image(spec.prompt)
-                image_path = output_path / image_filename
-                image.save(image_path)
-            except Exception as e:
-                print(f"Error generating image {image_filename}: {e}")
+        image_path = output_path / image_filename
+        generated = False
         
-        md_image = f"![{spec.alt}]({image_filename})\n*{spec.caption}*"
-        final_md = final_md.replace(spec.placeholder, md_image)
+        # Primary Image Generation: Cloudflare Workers AI API
+        if cf_account_id and cf_token:
+            model_name = os.environ.get("CF_IMAGE_MODEL")
+            try:
+                print(f"Generating image via Cloudflare Workers AI ({model_name}) for prompt: {spec.prompt}")
+                cf_url = f"https://api.cloudflare.com/client/v4/accounts/{cf_account_id}/ai/run/{model_name}"
+                res = requests.post(
+                    cf_url,
+                    headers={"Authorization": f"Bearer {cf_token}", "Content-Type": "application/json"},
+                    json={"prompt": spec.prompt},
+                    timeout=45
+                )
+                if res.status_code == 200:
+                    content_type = res.headers.get("content-type", "")
+                    if "application/json" in content_type:
+                        data = res.json()
+                        img_b64 = data.get("result", {}).get("image")
+                        if img_b64:
+                            image_path.write_bytes(base64.b64decode(img_b64))
+                            generated = True
+                            print(f"Successfully saved Cloudflare Workers AI image: {image_filename}")
+                    else:
+                        image_path.write_bytes(res.content)
+                        generated = True
+                        print(f"Successfully saved binary image from Cloudflare Workers AI: {image_filename}")
+                else:
+                    print(f"Cloudflare Workers AI status {res.status_code}: {res.text}")
+            except Exception as e:
+                print(f"Error generating Cloudflare Workers AI image {image_filename}: {e}")
+        
+        if generated or image_path.exists():
+            md_image = f"![{spec.alt}](http://127.0.0.1:8000/blogs/{image_filename}?v={ts})\n*{spec.caption}*"
+            final_md = final_md.replace(spec.placeholder, md_image)
+        else:
+            # If generation failed or skipped, clean up placeholder so no broken image appears
+            final_md = final_md.replace(spec.placeholder, "")
     
     md_filename = f"{base_filename}.md"
     (output_path / md_filename).write_text(final_md, encoding="utf-8")
@@ -316,25 +387,24 @@ def router_edge(state: State):
         return "research_node"
     return "orchestrator"
 
+def entry_router(state: State):
+    if state.get("feedback") and (state.get("final") or state.get("merged_md")):
+        return "refine_node"
+    return "router_node"
+
 graph = StateGraph(State)
 graph.add_node("router_node", router_node)
 graph.add_node("research_node", research_node)
-graph.add_node("orchestrator",orchestrator)
-graph.add_node("worker",worker)
-graph.add_node("reducer",reducer_subgraph)
+graph.add_node("orchestrator", orchestrator)
+graph.add_node("worker", worker)
+graph.add_node("refine_node", refine_node)
+graph.add_node("reducer", reducer_subgraph)
 
-graph.add_edge(START,"router_node")
+graph.add_conditional_edges(START, entry_router, ["refine_node", "router_node"])
 graph.add_conditional_edges("router_node", router_edge, ["research_node", "orchestrator"])
 graph.add_edge("research_node", "orchestrator")
-graph.add_conditional_edges("orchestrator",fanout,["worker"])
-graph.add_edge("worker","reducer")
-graph.add_edge("reducer",END)
+graph.add_conditional_edges("orchestrator", fanout, ["worker"])
+graph.add_edge("worker", "reducer")
+graph.add_edge("refine_node", "reducer")
+graph.add_edge("reducer", END)
 
-app = graph.compile()
-
-out = app.invoke({"topic" : "Open source AI models"})
-
-
-    
-    
-    

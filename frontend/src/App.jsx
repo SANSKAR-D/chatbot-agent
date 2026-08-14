@@ -5,31 +5,47 @@ import Header from './components/Header';
 import MessageList from './components/MessageList';
 import MessageInput from './components/MessageInput';
 import ConfirmModal from './components/ConfirmModal';
+import BlogProgress from './components/BlogProgress';
 
 function App() {
+  const [appMode, setAppMode] = useState(() => {
+    return localStorage.getItem('chatbot_app_mode') || 'chat';
+  });
+
+  useEffect(() => {
+    localStorage.setItem('chatbot_app_mode', appMode);
+  }, [appMode]);
+
   // Helper to load initial chats from localStorage or fallback to default new chat
-  const getInitialChats = () => {
-    const saved = localStorage.getItem('chatbot_chats');
+  const getInitialChats = (prefix, defaultTitle) => {
+    const saved = localStorage.getItem(`chatbot_${prefix}s`);
     if (saved) {
       try {
         const parsed = JSON.parse(saved);
         if (Array.isArray(parsed) && parsed.length > 0) return parsed;
       } catch (e) {
-        console.error("Error parsing chats from localStorage", e);
+        console.error(`Error parsing ${prefix}s from localStorage`, e);
       }
     }
-    return [{ id: 'chat_' + Date.now(), title: 'New Chat', messages: [] }];
+    return [{ id: `${prefix}_` + Date.now(), title: defaultTitle, messages: [], blogState: {} }];
   };
 
-  const initialChats = getInitialChats();
+  const initialChats = getInitialChats('chat', 'New Chat');
   const [chats, setChats] = useState(initialChats);
+  
+  const initialBlogs = getInitialChats('blog', 'New Blog');
+  const [blogThreads, setBlogThreads] = useState(initialBlogs);
 
   const [activeChatId, setActiveChatId] = useState(() => {
     const saved = localStorage.getItem('chatbot_active_chat_id');
-    if (saved && initialChats.some(c => c.id === saved)) {
-      return saved;
-    }
+    if (saved && initialChats.some(c => c.id === saved)) return saved;
     return initialChats[0]?.id || '';
+  });
+  
+  const [activeBlogId, setActiveBlogId] = useState(() => {
+    const saved = localStorage.getItem('chatbot_active_blog_id');
+    if (saved && initialBlogs.some(c => c.id === saved)) return saved;
+    return initialBlogs[0]?.id || '';
   });
 
   const [isSidebarOpen, setIsSidebarOpen] = useState(window.innerWidth > 768);
@@ -38,6 +54,7 @@ function App() {
   const [isStreaming, setIsStreaming] = useState(false);
   const [isUploading, setIsUploading] = useState(false);
   const fileInputRef = useRef(null);
+  
   const [confirmModal, setConfirmModal] = useState({
     isOpen: false,
     title: '',
@@ -50,63 +67,92 @@ function App() {
   useEffect(() => {
     localStorage.setItem('chatbot_chats', JSON.stringify(chats));
   }, [chats]);
+  
+  useEffect(() => {
+    localStorage.setItem('chatbot_blogs', JSON.stringify(blogThreads));
+  }, [blogThreads]);
 
   useEffect(() => {
     localStorage.setItem('chatbot_active_chat_id', activeChatId);
   }, [activeChatId]);
-
-  // On mount, sync thread list from backend database
+  
   useEffect(() => {
-    const syncThreads = async () => {
+    localStorage.setItem('chatbot_active_blog_id', activeBlogId);
+  }, [activeBlogId]);
+
+  // Sync threads on mount
+  useEffect(() => {
+    const syncChatThreads = async () => {
       try {
         const response = await fetch('http://127.0.0.1:8000/chat/threads');
         if (response.ok) {
           const data = await response.json();
           if (data && data.threads && data.threads.length > 0) {
-            // Update activeChatId to the first restored thread if currently selecting the temporary "New Chat"
             setActiveChatId((currentId) => {
               if (currentId && currentId.startsWith('chat_') && !data.threads.some(t => t.id === currentId)) {
                 return data.threads[0].id;
               }
               return currentId;
             });
-
             setChats((prevChats) => {
               const mergedChats = [...prevChats];
               data.threads.forEach((backendThread) => {
-                // Add the chat if it is not already in the frontend list
                 if (!mergedChats.some((c) => c.id === backendThread.id)) {
-                  mergedChats.push({
-                    id: backendThread.id,
-                    title: backendThread.title,
-                    messages: [] // Loaded on demand when selected
-                  });
+                  mergedChats.push({ id: backendThread.id, title: backendThread.title, messages: [] });
                 }
               });
-
-              // Remove the default empty "New Chat" if backend chats were restored
               if (mergedChats.length > 1) {
                 const firstChat = mergedChats[0];
                 if (firstChat && firstChat.title === 'New Chat' && firstChat.messages.length === 0) {
                   return mergedChats.filter((c) => c.id !== firstChat.id);
                 }
               }
-
               return mergedChats;
             });
           }
         }
-      } catch (error) {
-        console.error("Error syncing threads from backend:", error);
-      }
+      } catch (error) { console.error("Error syncing chats:", error); }
     };
-    syncThreads();
+    
+    const syncBlogThreads = async () => {
+      try {
+        const response = await fetch('http://127.0.0.1:8000/blog/threads');
+        if (response.ok) {
+          const data = await response.json();
+          if (data && data.threads && data.threads.length > 0) {
+            setActiveBlogId((currentId) => {
+              if (currentId && currentId.startsWith('blog_') && !data.threads.some(t => t.id === currentId)) {
+                return data.threads[0].id;
+              }
+              return currentId;
+            });
+            setBlogThreads((prevBlogs) => {
+              const mergedBlogs = [...prevBlogs];
+              data.threads.forEach((backendThread) => {
+                if (!mergedBlogs.some((c) => c.id === backendThread.id)) {
+                  mergedBlogs.push({ id: backendThread.id, title: backendThread.title, blogState: {} });
+                }
+              });
+              if (mergedBlogs.length > 1) {
+                const firstBlog = mergedBlogs[0];
+                if (firstBlog && firstBlog.title === 'New Blog' && (!firstBlog.blogState || Object.keys(firstBlog.blogState).length === 0)) {
+                  return mergedBlogs.filter((c) => c.id !== firstBlog.id);
+                }
+              }
+              return mergedBlogs;
+            });
+          }
+        }
+      } catch (error) { console.error("Error syncing blogs:", error); }
+    };
+
+    syncChatThreads();
+    syncBlogThreads();
   }, []);
 
-  // Fetch chat history from backend if active chat has no messages
+  // Fetch chat history
   useEffect(() => {
     if (!activeChatId) return;
-
     const currentChat = chats.find((c) => c.id === activeChatId);
     if (currentChat && currentChat.messages.length === 0) {
       const fetchHistory = async () => {
@@ -133,16 +179,51 @@ function App() {
               );
             }
           }
-        } catch (error) {
-          console.error("Error fetching chat history:", error);
-        }
+        } catch (error) { console.error("Error fetching chat history:", error); }
       };
       fetchHistory();
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeChatId]);
+  
+  // Fetch blog history
+  useEffect(() => {
+    if (!activeBlogId) return;
+    const currentBlog = blogThreads.find((c) => c.id === activeBlogId);
+    if (currentBlog && (!currentBlog.blogState || !currentBlog.blogState.finalMarkdown)) {
+      const fetchBlogHistory = async () => {
+        try {
+          const response = await fetch(`http://127.0.0.1:8000/blog/history/${activeBlogId}`);
+          if (response.ok) {
+            const data = await response.json();
+            if (data && data.final_markdown) {
+              setBlogThreads((prevBlogs) =>
+                prevBlogs.map((blog) => {
+                  if (blog.id === activeBlogId) {
+                    let newTitle = data.topic || blog.title;
+                    return { 
+                      ...blog, 
+                      title: newTitle, 
+                      blogState: { 
+                        isGenerating: false, 
+                        currentNode: '', 
+                        message: '', 
+                        finalMarkdown: data.final_markdown 
+                      } 
+                    };
+                  }
+                  return blog;
+                })
+              );
+            }
+          }
+        } catch (error) { console.error("Error fetching blog history:", error); }
+      };
+      fetchBlogHistory();
+    }
+  }, [activeBlogId]);
 
   const activeChat = chats.find(c => c.id === activeChatId) || chats[0];
+  const activeBlog = blogThreads.find(c => c.id === activeBlogId) || blogThreads[0];
   const messages = useMemo(() => activeChat?.messages || [], [activeChat]);
 
   const setMessages = (updater) => {
@@ -150,8 +231,6 @@ function App() {
       return prevChats.map((chat) => {
         if (chat.id === activeChatId) {
           const newMessages = typeof updater === 'function' ? updater(chat.messages) : updater;
-
-          // Auto-rename chat title if it's the default "New Chat" and contains a user message
           let newTitle = chat.title;
           if (chat.title === 'New Chat' || chat.title === '') {
             const firstUserMessage = newMessages.find((m) => m.sender === 'user');
@@ -160,42 +239,45 @@ function App() {
               if (firstUserMessage.text.length > 30) newTitle += '...';
             }
           }
-
           return { ...chat, title: newTitle, messages: newMessages };
         }
         return chat;
       });
     });
   };
+  
+  const updateActiveBlogState = (updater) => {
+    setBlogThreads((prevBlogs) => {
+      return prevBlogs.map((blog) => {
+        if (blog.id === activeBlogId) {
+          const newState = typeof updater === 'function' ? updater(blog.blogState || {}) : updater;
+          return { ...blog, blogState: { ...(blog.blogState || {}), ...newState } };
+        }
+        return blog;
+      });
+    });
+  };
 
-  // Auto-scroll to bottom
   const scrollToBottom = (behavior = 'smooth') => {
     messagesEndRef.current?.scrollIntoView({ behavior });
   };
 
   useEffect(() => {
-    scrollToBottom(shouldScrollSmoothRef.current ? 'smooth' : 'auto');
-    shouldScrollSmoothRef.current = true;
-  }, [messages, isStreaming]);
+    if (appMode === 'chat') {
+      scrollToBottom(shouldScrollSmoothRef.current ? 'smooth' : 'auto');
+      shouldScrollSmoothRef.current = true;
+    }
+  }, [messages, isStreaming, appMode]);
 
-  const fetchStream = async (messageText, isResume = false) => {
+  const fetchChatStream = async (messageText, isResume = false) => {
     setIsStreaming(true);
     try {
       const response = await fetch('http://127.0.0.1:8000/chat/stream', {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          message: messageText,
-          thread_id: activeChatId,
-          resume: isResume
-        }),
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ message: messageText, thread_id: activeChatId, resume: isResume }),
       });
-
-      if (!response.ok) {
-        throw new Error('Network response was not ok');
-      }
+      if (!response.ok) throw new Error('Network error');
 
       const reader = response.body.getReader();
       const decoder = new TextDecoder('utf-8');
@@ -220,7 +302,9 @@ function App() {
               setMessages((prev) => {
                 const newMessages = [...prev];
                 const lastIndex = newMessages.length - 1;
-                newMessages[lastIndex] = { ...newMessages[lastIndex], isStreaming: false, isThinking: false };
+                if (newMessages[lastIndex]) {
+                  newMessages[lastIndex] = { ...newMessages[lastIndex], isStreaming: false, isThinking: false };
+                }
                 return newMessages;
               });
               break;
@@ -232,36 +316,31 @@ function App() {
                 const toolCall = data.tool_calls[0];
                 setConfirmModal({
                   isOpen: true,
-                  title: 'Approve Stock Purchase',
-                  message: `The AI is requesting to purchase ${toolCall.args.quantity} shares of ${toolCall.args.symbol}. Do you approve this transaction?`,
+                  title: 'Approve Action',
+                  message: `The AI is requesting an action. Do you approve?`,
                   confirmText: 'Approve',
-                  onConfirm: async () => {
-                    fetchStream('', 'approve');
-                  },
-                  onCancel: async () => {
-                    fetchStream('', 'reject');
-                  }
+                  onConfirm: () => fetchChatStream('', 'approve'),
+                  onCancel: () => fetchChatStream('', 'reject')
                 });
-                return; // Keep isStreaming true, break out of stream reading
+                return;
               } else if (data.chunk) {
                 setMessages((prev) => {
                   const newMessages = [...prev];
                   const lastIndex = newMessages.length - 1;
                   newMessages[lastIndex] = {
                     ...newMessages[lastIndex],
-                    text: newMessages[lastIndex].text + data.chunk,
+                    text: (newMessages[lastIndex].text || '') + data.chunk,
                     isThinking: false
                   };
                   return newMessages;
                 });
               } else if (data.error) {
-                console.error("Server Error:", data.error);
                 setMessages((prev) => {
                   const newMessages = [...prev];
                   const lastIndex = newMessages.length - 1;
                   newMessages[lastIndex] = {
                     ...newMessages[lastIndex],
-                    text: newMessages[lastIndex].text + "\n[Error: " + data.error + "]",
+                    text: (newMessages[lastIndex].text || '') + "\n[Error: " + data.error + "]",
                     isStreaming: false,
                     isThinking: false
                   };
@@ -269,25 +348,75 @@ function App() {
                 });
                 setIsStreaming(false);
               }
-            } catch (err) {
-              console.error("Error parsing JSON chunk", err, dataStr);
-            }
+            } catch (err) { console.error("Error parsing JSON", err); }
           }
         }
       }
     } catch (error) {
-      console.error('Error fetching stream:', error);
-      setMessages((prev) => {
-        const newMessages = [...prev];
-        const lastIndex = newMessages.length - 1;
-        newMessages[lastIndex] = {
-          ...newMessages[lastIndex],
-          text: newMessages[lastIndex].text + "\n[Connection Error]",
-          isStreaming: false,
-          isThinking: false
-        };
-        return newMessages;
+      setIsStreaming(false);
+    }
+  };
+
+  const fetchBlogStream = async (topic, feedback = null) => {
+    setIsStreaming(true);
+    const initialMsg = feedback ? 'Revising blog based on feedback...' : 'Initializing blog generation...';
+    const initialNode = feedback ? 'refine_node' : 'router_node';
+    updateActiveBlogState({ isGenerating: true, currentNode: initialNode, message: initialMsg, finalMarkdown: '' });
+    
+    if (!feedback) {
+      setBlogThreads(prev => prev.map(b => b.id === activeBlogId ? { ...b, title: topic.slice(0, 30) + (topic.length > 30 ? '...' : '') } : b));
+    }
+
+    try {
+      const response = await fetch('http://127.0.0.1:8000/blog/stream', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ topic, thread_id: activeBlogId, feedback }),
       });
+      if (!response.ok) throw new Error('Network error');
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder('utf-8');
+      let buffer = '';
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop();
+
+        for (const line of lines) {
+          const trimmedLine = line.trim();
+          if (!trimmedLine) continue;
+
+          if (trimmedLine.startsWith('data: ')) {
+            const dataStr = trimmedLine.replace('data: ', '').trim();
+            if (dataStr === '[DONE]') {
+              setIsStreaming(false);
+              updateActiveBlogState({ isGenerating: false });
+              break;
+            }
+
+            try {
+              const data = JSON.parse(dataStr);
+              if (data.error) {
+                updateActiveBlogState({ isGenerating: false, message: 'Error: ' + data.error });
+                setIsStreaming(false);
+              } else {
+                updateActiveBlogState((prev) => ({
+                  currentNode: data.node || prev.currentNode,
+                  message: data.message || prev.message,
+                  finalMarkdown: data.final_markdown || prev.finalMarkdown
+                }));
+              }
+            } catch (err) { console.error("Error parsing JSON", err); }
+          }
+        }
+      }
+    } catch (error) {
+      updateActiveBlogState({ isGenerating: false, message: 'Network error occurred.' });
       setIsStreaming(false);
     }
   };
@@ -299,15 +428,23 @@ function App() {
     const userMessage = inputValue.trim();
     setInputValue('');
 
-    setMessages((prev) => [...prev, { text: userMessage, sender: 'user' }]);
-    setMessages((prev) => [...prev, { text: '', sender: 'bot', isStreaming: true, isThinking: true }]);
-    
-    fetchStream(userMessage, false);
+    if (appMode === 'chat') {
+      setMessages((prev) => [...prev, { text: userMessage, sender: 'user' }]);
+      setMessages((prev) => [...prev, { text: '', sender: 'bot', isStreaming: true, isThinking: true }]);
+      fetchChatStream(userMessage, false);
+    } else {
+      const hasExistingBlog = Boolean(activeBlog?.blogState?.finalMarkdown);
+      if (hasExistingBlog) {
+        fetchBlogStream(activeBlog.title || 'Blog', userMessage);
+      } else {
+        fetchBlogStream(userMessage);
+      }
+    }
   };
 
   const handleFileUpload = async (e) => {
     const file = e.target.files[0];
-    if (!file) return;
+    if (!file || appMode !== 'chat') return;
     
     if (file.type !== "application/pdf") {
       alert("Only PDF files are supported.");
@@ -319,7 +456,6 @@ function App() {
     formData.append("file", file);
     formData.append("thread_id", activeChatId);
     
-    // Add an optimistic system message
     setMessages((prev) => [...prev, { text: `Uploading ${file.name}...`, sender: 'bot', isSystem: true }]);
 
     try {
@@ -338,32 +474,30 @@ function App() {
       setMessages((prev) => [...prev, { text: `Network error uploading ${file.name}.`, sender: 'bot', isSystem: true }]);
     } finally {
       setIsUploading(false);
-      // clear the input
-      if (fileInputRef.current) {
-        fileInputRef.current.value = '';
-      }
+      if (fileInputRef.current) fileInputRef.current.value = '';
     }
   };
 
-  // Sidebar Actions
   const handleNewChat = () => {
     if (isStreaming) return;
-    const newId = 'chat_' + Date.now();
-    const newChat = { id: newId, title: 'New Chat', messages: [] };
-    setChats((prev) => [newChat, ...prev]);
-    setActiveChatId(newId);
-    if (window.innerWidth <= 768) {
-      setIsSidebarOpen(false);
+    if (appMode === 'chat') {
+      const newId = 'chat_' + Date.now();
+      setChats((prev) => [{ id: newId, title: 'New Chat', messages: [] }, ...prev]);
+      setActiveChatId(newId);
+    } else {
+      const newId = 'blog_' + Date.now();
+      setBlogThreads((prev) => [{ id: newId, title: 'New Blog', blogState: {} }, ...prev]);
+      setActiveBlogId(newId);
     }
+    if (window.innerWidth <= 768) setIsSidebarOpen(false);
   };
 
   const handleSelectChat = (chatId) => {
     if (isStreaming) return;
     shouldScrollSmoothRef.current = false;
-    setActiveChatId(chatId);
-    if (window.innerWidth <= 768) {
-      setIsSidebarOpen(false);
-    }
+    if (appMode === 'chat') setActiveChatId(chatId);
+    else setActiveBlogId(chatId);
+    if (window.innerWidth <= 768) setIsSidebarOpen(false);
   };
 
   const handleDeleteChat = (chatId, e) => {
@@ -372,32 +506,40 @@ function App() {
 
     setConfirmModal({
       isOpen: true,
-      title: 'Delete Chat',
-      message: 'Are you sure you want to delete this chat conversation? This action cannot be undone.',
+      title: appMode === 'chat' ? 'Delete Chat' : 'Delete Blog',
+      message: 'Are you sure you want to delete this? This action cannot be undone.',
       confirmText: 'Delete',
       onConfirm: async () => {
         try {
-          await fetch(`http://127.0.0.1:8000/chat/threads/${chatId}`, {
-            method: 'DELETE',
-          });
-        } catch (error) {
-          console.error("Error deleting chat:", error);
+          const endpoint = appMode === 'chat' ? `http://127.0.0.1:8000/chat/threads/${chatId}` : `http://127.0.0.1:8000/blog/threads/${chatId}`;
+          await fetch(endpoint, { method: 'DELETE' });
+        } catch (error) { console.error("Error deleting:", error); }
+
+        if (appMode === 'chat') {
+          const filtered = chats.filter((c) => c.id !== chatId);
+          let nextChats = filtered, nextActiveId = activeChatId;
+          if (filtered.length === 0) {
+            const newId = 'chat_' + Date.now();
+            nextChats = [{ id: newId, title: 'New Chat', messages: [] }];
+            nextActiveId = newId;
+          } else if (activeChatId === chatId) {
+            nextActiveId = filtered[0].id;
+          }
+          setChats(nextChats);
+          setActiveChatId(nextActiveId);
+        } else {
+          const filtered = blogThreads.filter((c) => c.id !== chatId);
+          let nextBlogs = filtered, nextActiveId = activeBlogId;
+          if (filtered.length === 0) {
+            const newId = 'blog_' + Date.now();
+            nextBlogs = [{ id: newId, title: 'New Blog', blogState: {} }];
+            nextActiveId = newId;
+          } else if (activeBlogId === chatId) {
+            nextActiveId = filtered[0].id;
+          }
+          setBlogThreads(nextBlogs);
+          setActiveBlogId(nextActiveId);
         }
-
-        const filtered = chats.filter((c) => c.id !== chatId);
-        let nextChats = filtered;
-        let nextActiveId = activeChatId;
-
-        if (filtered.length === 0) {
-          const newId = 'chat_' + Date.now();
-          nextChats = [{ id: newId, title: 'New Chat', messages: [] }];
-          nextActiveId = newId;
-        } else if (activeChatId === chatId) {
-          nextActiveId = filtered[0].id;
-        }
-
-        setChats(nextChats);
-        setActiveChatId(nextActiveId);
       }
     });
   };
@@ -407,33 +549,37 @@ function App() {
 
     setConfirmModal({
       isOpen: true,
-      title: 'Clear Chat History',
-      message: 'Are you sure you want to clear all chat conversations? This action cannot be undone.',
+      title: appMode === 'chat' ? 'Clear Chat History' : 'Clear Blog History',
+      message: 'Are you sure you want to clear all history for this mode? This action cannot be undone.',
       confirmText: 'Clear All',
       onConfirm: async () => {
         try {
-          await fetch('http://127.0.0.1:8000/chat/threads', {
-            method: 'DELETE',
-          });
-        } catch (error) {
-          console.error("Error clearing chats:", error);
-        }
+          const endpoint = appMode === 'chat' ? 'http://127.0.0.1:8000/chat/threads' : 'http://127.0.0.1:8000/blog/threads';
+          await fetch(endpoint, { method: 'DELETE' });
+        } catch (error) { console.error("Error clearing:", error); }
 
-        const newId = 'chat_' + Date.now();
-        setChats([{ id: newId, title: 'New Chat', messages: [] }]);
-        setActiveChatId(newId);
-        if (window.innerWidth <= 768) {
-          setIsSidebarOpen(false);
+        if (appMode === 'chat') {
+          const newId = 'chat_' + Date.now();
+          setChats([{ id: newId, title: 'New Chat', messages: [] }]);
+          setActiveChatId(newId);
+        } else {
+          const newId = 'blog_' + Date.now();
+          setBlogThreads([{ id: newId, title: 'New Blog', blogState: {} }]);
+          setActiveBlogId(newId);
         }
+        if (window.innerWidth <= 768) setIsSidebarOpen(false);
       }
     });
   };
+  
+  // Decide if input bar should be shown: keep visible when not actively generating
+  const showInput = appMode === 'chat' || !activeBlog?.blogState?.isGenerating;
 
   return (
     <div className="app-layout">
       <Sidebar
-        chats={chats}
-        activeChatId={activeChatId}
+        chats={appMode === 'chat' ? chats : blogThreads}
+        activeChatId={appMode === 'chat' ? activeChatId : activeBlogId}
         isStreaming={isStreaming}
         isSidebarOpen={isSidebarOpen}
         setIsSidebarOpen={setIsSidebarOpen}
@@ -441,26 +587,39 @@ function App() {
         onSelectChat={handleSelectChat}
         onDeleteChat={handleDeleteChat}
         onClearHistory={handleClearHistory}
+        appMode={appMode}
       />
 
       <main className="main-content">
         <Header 
-          activeChat={activeChat} 
+          activeChat={appMode === 'chat' ? activeChat : activeBlog} 
           isSidebarOpen={isSidebarOpen} 
           setIsSidebarOpen={setIsSidebarOpen} 
+          appMode={appMode}
+          setAppMode={setAppMode}
         />
 
         <div className="chat-container">
-          <MessageList messages={messages} messagesEndRef={messagesEndRef} />
-          <MessageInput
-            inputValue={inputValue}
-            setInputValue={setInputValue}
-            isStreaming={isStreaming}
-            isUploading={isUploading}
-            onSubmit={handleSubmit}
-            onFileUpload={handleFileUpload}
-            fileInputRef={fileInputRef}
-          />
+          {appMode === 'chat' ? (
+            <MessageList messages={messages} messagesEndRef={messagesEndRef} />
+          ) : (
+            <BlogProgress blogState={activeBlog?.blogState || {}} />
+          )}
+          
+          {showInput && (
+            <MessageInput
+              inputValue={inputValue}
+              setInputValue={setInputValue}
+              isStreaming={isStreaming}
+              isUploading={isUploading}
+              onSubmit={handleSubmit}
+              onFileUpload={handleFileUpload}
+              fileInputRef={fileInputRef}
+              appMode={appMode}
+              setAppMode={setAppMode}
+              hasExistingBlog={Boolean(activeBlog?.blogState?.finalMarkdown)}
+            />
+          )}
         </div>
       </main>
 
