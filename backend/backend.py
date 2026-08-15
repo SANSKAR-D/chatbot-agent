@@ -12,6 +12,7 @@ from dotenv import load_dotenv
 from langgraph.types import interrupt, Command
 from langgraph.store.base import BaseStore
 from langgraph.prebuilt import InjectedStore
+from langchain_core.messages import ToolMessage
 from tavily import AsyncTavilyClient
 import httpx
 import asyncio
@@ -94,27 +95,9 @@ async def search_pdf(query: str, config: RunnableConfig) -> str:
     Use this tool whenever the user asks questions about their uploaded PDF files, documents, or requests a summary or content extraction.
     Input a descriptive search query based on what the user is asking. If they ask for a summary, query for 'summary or main topics'.
     """
-    thread_id = config.get("configurable", {}).get("thread_id")
-    if not thread_id:
-        return "Error: No active chat thread ID found."
-    
-    vectorstore_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vectorstores", thread_id)
-    if not os.path.exists(vectorstore_path):
-        return "No PDF documents have been uploaded for this chat yet."
-    
-    try:
-        from langchain_google_genai import GoogleGenerativeAIEmbeddings
-        embeddings = GoogleGenerativeAIEmbeddings(model="models/gemini-embedding-2")
-        vectorstore = FAISS.load_local(vectorstore_path, embeddings, allow_dangerous_deserialization=True)
-        retriever = vectorstore.as_retriever(search_kwargs={"k": 5})
-        docs = await retriever.ainvoke(query)
-        
-        if not docs:
-            return "No relevant information found in the uploaded documents."
-            
-        return "\n\n".join([d.page_content for d in docs])
-    except Exception as e:
-        return f"Error searching PDF documents: {str(e)}"
+    # This tool is intercepted by route_after_chat and processed by rag_node subgraph.
+    # It will never actually be executed here.
+    return "Processed by RAG subgraph"
 
 @tool
 async def generate_ascii_art(text: str, font: str = "standard") -> str:
@@ -283,16 +266,65 @@ def should_summarize(state: ChatState):
         return "summarize_node"
     return "chat_node"
 
+async def rag_node(state: ChatState, config: RunnableConfig):
+    """Subgraph wrapper node for RAG processing."""
+    from rag import rag_graph
+    
+    last_message = state["messages"][-1]
+    tool_messages = []
+    
+    for tc in getattr(last_message, "tool_calls", []):
+        if tc["name"] == "search_pdf":
+            query = tc.get("args", {}).get("query", "")
+            
+            if not isinstance(query, str):
+                texts = []
+                if isinstance(query, list):
+                    def extract_text(item):
+                        if isinstance(item, list):
+                            for sub in item: extract_text(sub)
+                        elif isinstance(item, dict) and item.get("type") == "text":
+                            texts.append(item.get("text", ""))
+                        elif isinstance(item, str):
+                            texts.append(item)
+                    extract_text(query)
+                    query = " ".join(texts)
+                else:
+                    query = str(query)
+                query = query[:2000]
+                
+            result = await rag_graph.ainvoke({"question": query}, config)
+            ans = result.get("generation", "No answer found.")
+            tool_messages.append(ToolMessage(tool_call_id=tc["id"], name="search_pdf", content=ans))
+            
+    return {"messages": tool_messages}
+
+def route_after_chat(state: ChatState):
+    """Route to tools, rag_node, or END based on tool calls."""
+    last_message = state["messages"][-1]
+    
+    if hasattr(last_message, "tool_calls") and last_message.tool_calls:
+        if any(tc["name"] == "search_pdf" for tc in last_message.tool_calls):
+            return "rag_node"
+        return "tools"
+    return END
+
 graph_builder = StateGraph(ChatState)
 graph_builder.add_node("summarize_node", summarize_node)
 graph_builder.add_node("chat_node", chat_node)
 graph_builder.add_node("tools", tool_node)
+graph_builder.add_node("rag_node", rag_node)
 
 graph_builder.add_conditional_edges(START, should_summarize)
 graph_builder.add_edge("summarize_node", "chat_node")
 
-graph_builder.add_conditional_edges("chat_node", tools_condition)
+graph_builder.add_conditional_edges("chat_node", route_after_chat, {
+    "rag_node": "rag_node",
+    "tools": "tools",
+    END: END
+})
 graph_builder.add_edge("tools", "chat_node")
+graph_builder.add_edge("rag_node", "chat_node")
 
 # We export graph_builder so we can compile it with async memory in api.py
 graph = graph_builder.compile()
