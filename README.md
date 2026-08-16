@@ -29,13 +29,13 @@ The backend employs a complex State Machine that proactively intercepts maliciou
 
 ```mermaid
 graph LR
-    subgraph Frontend [Frontend (React + Vite)]
+    subgraph Frontend ["Frontend (React + Vite)"]
         UI[Chat / Blog UI]
         SSE[EventSource stream listener]
         MD[React Markdown Renderer]
     end
     
-    subgraph Backend [Backend (FastAPI + LangGraph)]
+    subgraph Backend ["Backend (FastAPI + LangGraph)"]
         API[StreamingResponse Endpoints]
         RAG[RAG Chat State Machine]
         BLOG[Blog Generator State Machine]
