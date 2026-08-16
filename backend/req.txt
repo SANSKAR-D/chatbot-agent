@@ -17,3 +17,7 @@ langchain_tavily
 huggingface_hub
 rank-bm25
 langchain.ret
+langchain-google-genai
+pypdf
+python-multipart
+tavily-python
