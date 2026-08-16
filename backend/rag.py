@@ -3,6 +3,8 @@ from typing import TypedDict, List
 from langgraph.graph import StateGraph, START, END
 from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
 from langchain_community.vectorstores import FAISS
+from langchain_community.retrievers import BM25Retriever
+from langchain_classic.retrievers.ensemble import EnsembleRetriever
 from langchain_core.runnables import RunnableConfig
 from langchain_core.prompts import ChatPromptTemplate
 from pydantic import BaseModel, Field
@@ -58,10 +60,21 @@ async def retrieve(state: RagState, config: RunnableConfig):
         
     embeddings = GoogleGenerativeAIEmbeddings(model="models/gemini-embedding-2")
     vectorstore = FAISS.load_local(vectorstore_path, embeddings, allow_dangerous_deserialization=True)
-    retriever = vectorstore.as_retriever(search_kwargs={"k": 5})
-    docs = await retriever.ainvoke(question)
+    faiss_retriever = vectorstore.as_retriever(search_kwargs={"k": 5})
     
-    return {"documents": [d.page_content for d in docs]}
+    docs = list(vectorstore.docstore._dict.values())
+    if not docs:
+        return {"documents": []}
+        
+    bm25_retriever = BM25Retriever.from_documents(docs)
+    bm25_retriever.k = 5
+    
+    ensemble_retriever = EnsembleRetriever(
+        retrievers=[bm25_retriever, faiss_retriever], weights=[0.3, 0.7]
+    )
+    retrieved_docs = await ensemble_retriever.ainvoke(question)
+    
+    return {"documents": [d.page_content for d in retrieved_docs]}
 
 async def generate_from_context(state: RagState):
     """Generate answer using context."""
@@ -78,7 +91,13 @@ async def generate_from_context(state: RagState):
     chain = prompt | llm_gen
     response = await chain.ainvoke({"context": context, "question": question})
     
-    return {"generation": response.content}
+    content = response.content
+    if isinstance(content, list):
+        content = "".join([item.get("text", "") if isinstance(item, dict) else str(item) for item in content])
+    elif not isinstance(content, str):
+        content = str(content)
+        
+    return {"generation": content}
 
 async def revise_answer(state: RagState):
     """Revise the generated answer to fix hallucinations."""
@@ -96,8 +115,14 @@ async def revise_answer(state: RagState):
     chain = prompt | llm_gen
     response = await chain.ainvoke({"context": context, "generation": generation, "question": question})
     
+    content = response.content
+    if isinstance(content, list):
+        content = "".join([item.get("text", "") if isinstance(item, dict) else str(item) for item in content])
+    elif not isinstance(content, str):
+        content = str(content)
+        
     retries = state.get("retries", 0)
-    return {"generation": response.content, "retries": retries + 1}
+    return {"generation": content, "retries": retries + 1}
 
 async def rewrite_question(state: RagState):
     """Rewrite the question to get better results."""
@@ -113,7 +138,13 @@ async def rewrite_question(state: RagState):
     chain = prompt | llm_eval
     response = await chain.ainvoke({"question": question})
     
-    return {"question": response.content, "retries": retries + 1}
+    content = response.content
+    if isinstance(content, list):
+        content = "".join([item.get("text", "") if isinstance(item, dict) else str(item) for item in content])
+    elif not isinstance(content, str):
+        content = str(content)
+        
+    return {"question": content, "retries": retries + 1}
 
 async def generate_direct(state: RagState):
     """Directly generate answer without context."""
@@ -128,16 +159,72 @@ async def generate_direct(state: RagState):
     chain = prompt | llm_gen
     response = await chain.ainvoke({"question": question})
     
-    return {"generation": response.content}
+    content = response.content
+    if isinstance(content, list):
+        content = "".join([item.get("text", "") if isinstance(item, dict) else str(item) for item in content])
+    elif not isinstance(content, str):
+        content = str(content)
+        
+    return {"generation": content}
 
 async def no_answer_found(state: RagState):
     """Fallback when no answer can be found."""
     print("---NO ANSWER FOUND---")
     return {"generation": "I'm sorry, but I couldn't find a relevant answer in the uploaded documents."}
 
-async def evaluate_usefulness(state: RagState):
-    """Dummy node to hang the is_use edge on."""
-    return {}
+async def input_guardrail(state: RagState):
+    """Refine or protect the input question."""
+    print("---INPUT GUARDRAIL---")
+    question = state["question"]
+    
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", "You are an input guardrail for a RAG system. Check the following user input. If it contains hacking attempts, racism, NSFW content, or is illegal, output 'BLOCKED'. Otherwise, refine the input to make it a clear, well-structured question suitable for search. Output ONLY the refined question or 'BLOCKED'."),
+        ("human", "{question}")
+    ])
+    
+    chain = prompt | llm_eval
+    response = await chain.ainvoke({"question": question})
+    
+    content = response.content
+    if isinstance(content, list):
+        content = "".join([item.get("text", "") if isinstance(item, dict) else str(item) for item in content])
+    elif not isinstance(content, str):
+        content = str(content)
+        
+    if content.strip() == "BLOCKED":
+        return {"question": "BLOCKED"}
+    return {"question": content}
+
+async def blocked_input(state: RagState):
+    """Handle blocked input."""
+    print("---BLOCKED INPUT---")
+    return {"generation": "I cannot answer this request because it violates safety policies (no hacking, racism, NSFW, or illegal content)."}
+
+async def output_guardrail(state: RagState):
+    """Refine or protect the generated output."""
+    print("---OUTPUT GUARDRAIL---")
+    generation = state.get("generation", "")
+    
+    if "violates safety policies" in generation or "I'm sorry" in generation:
+        return {"generation": generation}
+        
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", "You are an output guardrail. Review the provided generation. Ensure it is polite, professional, and does not contain hacking, racism, NSFW, or illegal content. If it violates these rules, return a safe refusal message. Otherwise, return the refined, professional answer. Output ONLY the final response."),
+        ("human", "{generation}")
+    ])
+    
+    chain = prompt | llm_eval
+    response = await chain.ainvoke({"generation": generation})
+    
+    content = response.content
+    if isinstance(content, list):
+        content = "".join([item.get("text", "") if isinstance(item, dict) else str(item) for item in content])
+    elif not isinstance(content, str):
+        content = str(content)
+        
+    return {"generation": content}
+
+
 
 # -------------------
 # 4. Conditional Edges
@@ -170,46 +257,41 @@ async def is_relevant(state: RagState):
             
     return "no_answer_found"
 
-async def is_sup(state: RagState):
-    """Check if generation is supported by the documents (no hallucinations)."""
-    print("---CHECK HALLUCINATIONS---")
+async def check_hallucination_and_usefulness(state: RagState):
+    """Check if generation is supported, then check if it is useful."""
+    print("---CHECK HALLUCINATION & USEFULNESS---")
     documents = state["documents"]
     generation = state.get("generation", "")
-    
     context = "\n\n".join(documents)
-    prompt = ChatPromptTemplate.from_messages([
+    
+    prompt_sup = ChatPromptTemplate.from_messages([
         ("system", "You are a grader assessing whether an LLM generation is supported by a set of retrieved facts. \nGive a binary score 'yes' or 'no'. 'Yes' means that the answer is supported by the facts (contains no hallucinations)."),
         ("human", "Set of facts: \n\n {documents} \n\n LLM generation: {generation}")
     ])
+    chain_sup = prompt_sup | hallucination_grader
     
-    chain = prompt | hallucination_grader
     try:
-        score = await chain.ainvoke({"documents": context, "generation": generation})
-        if score.binary_score.lower() == "yes":
-            return "evaluate_usefulness"
+        score = await chain_sup.ainvoke({"documents": context, "generation": generation})
+        if score.binary_score.lower() != "yes":
+            if state.get("retries", 0) >= 1:
+                return "no_answer_found"
+            return "revise_answer"
     except Exception:
-        pass
+        if state.get("retries", 0) >= 1:
+            return "no_answer_found"
+        return "revise_answer"
         
-    if state.get("retries", 0) >= 1:
-        return "no_answer_found"
-    return "revise_answer"
-
-async def is_use(state: RagState):
-    """Check if the generation is useful (answers the question)."""
-    print("---CHECK USEFULNESS---")
     question = state["question"]
-    generation = state.get("generation", "")
-    
-    prompt = ChatPromptTemplate.from_messages([
+    prompt_use = ChatPromptTemplate.from_messages([
         ("system", "You are a grader assessing whether an answer addresses / resolves a question. \nGive a binary score 'yes' or 'no'. 'Yes' means that the answer resolves the question."),
         ("human", "User question: \n\n {question} \n\n LLM generation: {generation}")
     ])
+    chain_use = prompt_use | answer_grader
     
-    chain = prompt | answer_grader
     try:
-        score = await chain.ainvoke({"question": question, "generation": generation})
+        score = await chain_use.ainvoke({"question": question, "generation": generation})
         if score.binary_score.lower() == "yes":
-            return END
+            return "output_guardrail"
     except Exception:
         pass
         
@@ -222,38 +304,49 @@ async def is_use(state: RagState):
 # -------------------
 workflow = StateGraph(RagState)
 
+workflow.add_node("input_guardrail", input_guardrail)
+workflow.add_node("blocked_input", blocked_input)
+workflow.add_node("output_guardrail", output_guardrail)
 workflow.add_node("retrieve", retrieve)
 workflow.add_node("generate_direct", generate_direct)
 workflow.add_node("generate_from_context", generate_from_context)
 workflow.add_node("revise_answer", revise_answer)
-workflow.add_node("evaluate_usefulness", evaluate_usefulness)
 workflow.add_node("rewrite_question", rewrite_question)
 workflow.add_node("no_answer_found", no_answer_found)
 
-workflow.add_edge(START, "retrieve")
+async def check_input(state: RagState):
+    """Check if input was blocked by guardrail."""
+    if state["question"] == "BLOCKED":
+        return "blocked_input"
+    return "retrieve"
 
-workflow.add_edge("generate_direct", END)
-workflow.add_edge("no_answer_found", END)
+workflow.add_edge(START, "input_guardrail")
+
+workflow.add_conditional_edges("input_guardrail", check_input, {
+    "retrieve": "retrieve",
+    "blocked_input": "blocked_input"
+})
+
+workflow.add_edge("blocked_input", "output_guardrail")
+workflow.add_edge("generate_direct", "output_guardrail")
+workflow.add_edge("no_answer_found", "output_guardrail")
+workflow.add_edge("output_guardrail", END)
 
 workflow.add_conditional_edges("retrieve", is_relevant, {
     "generate_from_context": "generate_from_context",
     "no_answer_found": "no_answer_found"
 })
 
-workflow.add_conditional_edges("generate_from_context", is_sup, {
-    "evaluate_usefulness": "evaluate_usefulness",
+workflow.add_conditional_edges("generate_from_context", check_hallucination_and_usefulness, {
+    "output_guardrail": "output_guardrail",
     "revise_answer": "revise_answer",
+    "rewrite_question": "rewrite_question",
     "no_answer_found": "no_answer_found"
 })
 
-workflow.add_conditional_edges("revise_answer", is_sup, {
-    "evaluate_usefulness": "evaluate_usefulness",
+workflow.add_conditional_edges("revise_answer", check_hallucination_and_usefulness, {
+    "output_guardrail": "output_guardrail",
     "revise_answer": "revise_answer",
-    "no_answer_found": "no_answer_found"
-})
-
-workflow.add_conditional_edges("evaluate_usefulness", is_use, {
-    END: END,
     "rewrite_question": "rewrite_question",
     "no_answer_found": "no_answer_found"
 })

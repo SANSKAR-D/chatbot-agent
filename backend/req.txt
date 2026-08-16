@@ -15,3 +15,5 @@ psycopg_pool
 pyfiglet
 langchain_tavily
 huggingface_hub
+rank-bm25
+langchain.ret

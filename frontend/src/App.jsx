@@ -1,5 +1,6 @@
 import { useState, useRef, useEffect, useMemo } from 'react';
 import './index.css';
+import './App.css';
 import Sidebar from './components/Sidebar';
 import Header from './components/Header';
 import MessageList from './components/MessageList';
@@ -601,7 +602,7 @@ function App() {
 
         <div className="chat-container">
           {appMode === 'chat' ? (
-            <MessageList messages={messages} messagesEndRef={messagesEndRef} />
+            <MessageList messages={messages} messagesEndRef={messagesEndRef} setInputValue={setInputValue} />
           ) : (
             <BlogProgress blogState={activeBlog?.blogState || {}} />
           )}

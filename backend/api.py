@@ -1,6 +1,6 @@
 from fastapi import FastAPI, File, UploadFile, Form
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel
 import json
 import asyncio
@@ -340,7 +340,20 @@ async def upload_pdf(thread_id: str = Form(...), file: UploadFile = File(...)):
         # Clean up temp file
         os.remove(temp_file_path)
         
-        return {"status": "success", "message": f"Successfully processed {len(splits)} chunks from {file.filename}."}
+        # Send system notification to the chatbot thread state so the LLM knows the document is uploaded
+        config = {"configurable": {"thread_id": thread_id}}
+        from langchain_core.messages import HumanMessage, AIMessage
+        
+        # Add a HumanMessage and an AIMessage to maintain strict turn-based alternation (required by Gemini models)
+        await chatbot.aupdate_state(
+            config,
+            {"messages": [
+                HumanMessage(content=f"[SYSTEM NOTIFICATION]: The user has successfully uploaded a PDF document named '{file.filename}'. Please acknowledge and use the search_pdf tool when answering questions about it."),
+                AIMessage(content=f"Understood. I will use the search_pdf tool to find answers in '{file.filename}'.")
+            ]}
+        )
+        
+        return JSONResponse(content={"status": "success", "message": "Document uploaded and indexed successfully!"})
     except Exception as e:
         return {"status": "error", "message": str(e)}
 

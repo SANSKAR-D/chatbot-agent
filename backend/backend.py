@@ -198,8 +198,14 @@ async def summarize_node(state: ChatState):
         
         response = await llm.ainvoke([summary_sys] + to_summarize + [summary_req])
         
+        content = response.content
+        if isinstance(content, list):
+            content = "".join([item.get("text", "") if isinstance(item, dict) else str(item) for item in content])
+        elif not isinstance(content, str):
+            content = str(content)
+            
         return {
-            "summary": response.content,
+            "summary": content,
             "summarized_count": split_idx
         }
     return {}
