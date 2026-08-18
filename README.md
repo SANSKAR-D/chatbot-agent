@@ -8,9 +8,8 @@ This repository is split into two primary components, each with its own detailed
 
 ## 🎬 Demo
 
-[![Watch Demo Video](https://img.shields.io/badge/▶%EF%B8%8F_Watch_Demo_Video-Click_Here-blue?style=for-the-badge&logo=youtube)](https://github.com/SANSKAR-D/chatbot-agent/blob/main/frontend/public/demo.mp4)
+https://github.com/user-attachments/assets/439037c9-8527-4123-896c-681bf9c3936a
 
-> 💡 **Tip:** [Click here to watch the full walkthrough demo video](./frontend/public/demo.mp4) directly in your browser.
 
 ## 🌟 Key Features
 
