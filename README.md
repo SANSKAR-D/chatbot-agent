@@ -6,6 +6,12 @@ This repository is split into two primary components, each with its own detailed
 - **[Backend Architecture & Workflows](./backend/README.md)** (FastAPI, LangGraph, FAISS)
 - **[Frontend UI & Streaming](./frontend/README.md)** (React, Vite, Server-Sent Events)
 
+## 🎬 Demo
+
+<video src="./frontend/public/demo.mp4" controls="controls" width="100%" style="max-width: 100%; border-radius: 8px;" autoplay loop muted>
+  Your browser does not support the video tag. You can view the demo video directly at <a href="./frontend/public/demo.mp4">frontend/public/demo.mp4</a>.
+</video>
+
 ## 🌟 Key Features
 
 ### 1. Hybrid Search (FAISS + BM25)
