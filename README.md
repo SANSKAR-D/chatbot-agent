@@ -8,9 +8,9 @@ This repository is split into two primary components, each with its own detailed
 
 ## 🎬 Demo
 
-<video src="./frontend/public/demo.mp4" controls="controls" width="100%" style="max-width: 100%; border-radius: 8px;" autoplay loop muted>
-  Your browser does not support the video tag. You can view the demo video directly at <a href="./frontend/public/demo.mp4">frontend/public/demo.mp4</a>.
-</video>
+[![Watch Demo Video](https://img.shields.io/badge/▶%EF%B8%8F_Watch_Demo_Video-Click_Here-blue?style=for-the-badge&logo=youtube)](https://github.com/SANSKAR-D/chatbot-agent/blob/main/frontend/public/demo.mp4)
+
+> 💡 **Tip:** [Click here to watch the full walkthrough demo video](./frontend/public/demo.mp4) directly in your browser.
 
 ## 🌟 Key Features
 
